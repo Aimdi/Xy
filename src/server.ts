@@ -54,6 +54,7 @@ function notFound(res: ServerResponse): void {
       'GET /health',
       'GET /debug/ping',
       'GET /debug/upstream?username=zuck',
+      'GET /debug/refresh-doc-ids',
       'GET /profile/:username',
       'GET /user-id/:username',
       'GET /post-id/:shortcodeOrUrl',
@@ -127,6 +128,94 @@ function diagnosticsPayload() {
   };
 }
 
+function extractUpstreamJsonMessage(parsed: unknown): string | undefined {
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const obj = parsed as Record<string, unknown>;
+  const message =
+    typeof obj.message === 'string' && obj.message.trim()
+      ? obj.message.trim()
+      : typeof obj.error_message === 'string' && obj.error_message.trim()
+        ? obj.error_message.trim()
+        : undefined;
+  const errorType =
+    typeof obj.error_type === 'string' && obj.error_type.trim()
+      ? obj.error_type.trim()
+      : undefined;
+  if (errorType && message) {
+    return message.includes(errorType) ? message : `${errorType}: ${message}`;
+  }
+  if (message) return message;
+  if (errorType) return errorType;
+  if (Array.isArray(obj.errors) && obj.errors[0]) {
+    const first = obj.errors[0] as Record<string, unknown>;
+    if (typeof first.message === 'string' && first.message.trim()) return first.message;
+  }
+  return undefined;
+}
+
+function adviceForUpstreamResults(
+  results: Array<Record<string, unknown>>,
+  runtime: ReturnType<typeof curlRuntimeInfo>,
+  anyOk: boolean,
+): string {
+  if (anyOk) return 'Upstream works from this host.';
+  if (runtime.curl_on_path === false) {
+    return 'curl is missing in this container. Redeploy using the repo Dockerfile (apt installs curl).';
+  }
+  if (runtime.http2 === false) {
+    return 'curl has no HTTP/2. Meta returns empty 429 on HTTP/1.1. Install curl with nghttp2.';
+  }
+
+  const httpResults = results.filter((r) => typeof r.status === 'number');
+  const jsonClientErrors = httpResults.filter((r) => {
+    if (r.status !== 400 && r.status !== 404) return false;
+    if (typeof r.upstream_message === 'string' && String(r.upstream_message).trim()) {
+      return true;
+    }
+    const preview = String(r.body_preview ?? '').trimStart();
+    const bodyLen = Number(r.body_len ?? 0);
+    return bodyLen > 0 && (preview.startsWith('{') || preview.startsWith('['));
+  });
+  if (jsonClientErrors.length > 0) {
+    const first = jsonClientErrors[0];
+    const msg =
+      typeof first.upstream_message === 'string' && String(first.upstream_message).trim()
+        ? String(first.upstream_message)
+        : String(first.body_preview ?? 'JSON error body').trim();
+    return (
+      `Upstream returned HTTP ${first.status} with a JSON error ` +
+      `(${msg}). This usually means a stale identifier (doc_id / fbtype mismatch), ` +
+      `not an IP block. Try GET /debug/refresh-doc-ids, then retry.`
+    );
+  }
+
+  // Only suggest proxy / IP block for empty bodies or HTTP 429.
+  const looksBlocked = httpResults.some((r) => {
+    const status = r.status as number;
+    const bodyLen = Number(r.body_len ?? 0);
+    return status === 429 || bodyLen === 0;
+  });
+  if (looksBlocked) {
+    return (
+      'Meta is likely blocking this server IP (common on Coolify/VPS/datacenter ASNs). ' +
+      'Set XY_PROXY to a residential HTTP proxy, or run Xy on a home Raspberry Pi.'
+    );
+  }
+
+  const previews = httpResults
+    .map((r) => String(r.body_preview ?? '').trim())
+    .filter(Boolean);
+  if (previews.length > 0) {
+    return (
+      `Upstream failed with non-empty responses (not empty/429). ` +
+      `Inspect results[].body_preview; if you see NodeInvalidTypeException / fbtype mismatch, ` +
+      `refresh doc ids via GET /debug/refresh-doc-ids rather than changing proxy.`
+    );
+  }
+
+  return 'Upstream checks failed. Inspect results[] for status, body_preview, and errors.';
+}
+
 async function debugUpstream(username: string) {
   const runtime = curlRuntimeInfo();
   const results: Array<Record<string, unknown>> = [];
@@ -149,9 +238,11 @@ async function debugUpstream(username: string) {
       });
       let parsed: unknown = null;
       let userId: string | undefined;
+      let upstreamMessage: string | undefined;
       try {
         parsed = JSON.parse(res.body);
         userId = (parsed as { data?: { user?: { id?: string } } })?.data?.user?.id;
+        upstreamMessage = extractUpstreamJsonMessage(parsed);
       } catch {
         // ignore
       }
@@ -161,6 +252,7 @@ async function debugUpstream(username: string) {
         http_version: res.httpVersion,
         body_len: res.body.length,
         user_id: userId,
+        upstream_message: upstreamMessage,
         hint: res.headers['x-xy-curl-hint'],
         body_preview: res.body.slice(0, 160),
       });
@@ -178,13 +270,7 @@ async function debugUpstream(username: string) {
     username,
     runtime,
     results,
-    advice: anyOk
-      ? 'Upstream works from this host.'
-      : runtime.curl_on_path === false
-        ? 'curl is missing in this container. Redeploy using the repo Dockerfile (apt installs curl).'
-        : runtime.http2 === false
-          ? 'curl has no HTTP/2. Meta returns empty 429 on HTTP/1.1. Install curl with nghttp2.'
-          : 'Meta is likely blocking this server IP (common on Coolify/VPS/datacenter ASNs). Set XY_PROXY to a residential HTTP proxy, or run Xy on a home Raspberry Pi.',
+    advice: adviceForUpstreamResults(results, runtime, Boolean(anyOk)),
   };
 }
 
@@ -231,6 +317,16 @@ const server = createServer(async (req, res) => {
     if (parts[0] === 'debug' && parts[1] === 'upstream' && parts.length === 2) {
       const username = url.searchParams.get('username') || 'zuck';
       send(res, 200, await debugUpstream(username));
+      return;
+    }
+
+    if (parts[0] === 'debug' && parts[1] === 'refresh-doc-ids' && parts.length === 2) {
+      const docIds = await api.refreshDocIds(true);
+      send(res, 200, {
+        ok: true,
+        count: Object.keys(docIds).length,
+        doc_ids: docIds,
+      });
       return;
     }
 

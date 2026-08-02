@@ -6,6 +6,8 @@ export type UpstreamHint =
   | 'non_json'
   | 'missing_user'
   | 'parse_error'
+  /** Stale GraphQL doc_id / Relay node type mismatch (not an IP block). */
+  | 'stale_identifier'
   | 'unknown';
 
 export type TransportKind = 'fetch' | 'curl';
@@ -18,12 +20,27 @@ export interface ThreadsAPIErrorMeta {
 }
 
 /**
+ * Meta NodeInvalidTypeException / fbtype mismatch — stale GraphQL doc_id or
+ * wrong Relay node type, not rate-limiting or IP blocking.
+ */
+export function looksLikeStaleIdentifier(text: string): boolean {
+  if (!text) return false;
+  return /NodeInvalidTypeException|NodeInvalidType|wrong\s+fbtype|fbtype\s+mismatch|expected\s+fbtype/i.test(
+    text,
+  );
+}
+
+/**
  * Classify an HTTP body from Threads/Meta into a diagnostic hint.
  * Prefer this over dumping raw HTML into clients.
  */
 export function classifyUpstreamBody(status: number, text: string): UpstreamHint {
   if (status === 429) return 'rate_limited';
   if (text == null || !String(text).trim()) return 'empty_body';
+
+  // Detect before HTML / non-JSON gates so exception strings in JSON (or plain
+  // text) are not mistaken for blocks or generic failures.
+  if (looksLikeStaleIdentifier(text)) return 'stale_identifier';
 
   const trimmed = String(text).trimStart().toLowerCase();
   if (
@@ -132,6 +149,7 @@ export function httpStatusForThreadsError(err: ThreadsAPIError): number {
   if (s != null && s >= 500) return 502;
   if (err.upstream === 'rate_limited') return 429;
   if (err.upstream === 'html_challenge' || err.upstream === 'empty_body') return 502;
+  if (err.upstream === 'stale_identifier') return 502;
   if (err.name === 'DocIdNotFoundError') return 503;
   if (s != null && s >= 400) return 502;
   return 500;

@@ -16,6 +16,7 @@ import {
   bodyPreview,
   classifyUpstreamBody,
   DocIdNotFoundError,
+  looksLikeStaleIdentifier,
   ThreadsAPIError,
   type TransportKind,
 } from './errors.js';
@@ -355,6 +356,18 @@ export class ThreadsAPI {
       json = JSON.parse(text) as GraphQLResponse<T>;
     } catch {
       const upstream = classifyUpstreamBody(res.status, text);
+      // HTTP 400 NodeInvalidTypeException bodies are usually JSON, but still
+      // self-heal if the raw text matches before giving up on parse.
+      if (options.retryOnStaleDocId !== false && upstream === 'stale_identifier') {
+        if (this.verbose) {
+          console.debug('[graphql] stale identifier in non-JSON body, refreshing doc_ids…');
+        }
+        await this.refreshDocIds(true);
+        return this.graphql(operationName, variables, {
+          ...options,
+          retryOnStaleDocId: false,
+        });
+      }
       throw new ThreadsAPIError(
         `Failed to parse GraphQL JSON (HTTP ${res.status})`,
         bodyPreview(text, 300),
@@ -367,14 +380,33 @@ export class ThreadsAPI {
       );
     }
 
-    // Self-heal: if Meta rotated the doc_id, refresh and retry once
-    const stale =
-      options.retryOnStaleDocId !== false &&
-      json.errors?.some((e) =>
-        /not found|unknown|doc_id|persisted/i.test(e.message ?? ''),
-      );
-    if (stale) {
-      if (this.verbose) console.debug('[graphql] stale doc_id, refreshing…');
+    // Self-heal: Meta rotated doc_id, or NodeInvalidTypeException / fbtype mismatch
+    // (stale persisted operation / wrong node type — not an IP block).
+    const upstreamHint = classifyUpstreamBody(res.status, text);
+    const errorMessages = (json.errors ?? []).map((e) => e.message ?? '').join('\n');
+    const jsonMessage =
+      typeof (json as { message?: unknown }).message === 'string'
+        ? ((json as { message: string }).message)
+        : '';
+    const staleIdentifier =
+      upstreamHint === 'stale_identifier' ||
+      looksLikeStaleIdentifier(text) ||
+      looksLikeStaleIdentifier(errorMessages) ||
+      looksLikeStaleIdentifier(jsonMessage);
+    const staleDocId = json.errors?.some((e) =>
+      /not found|unknown|doc_id|persisted/i.test(e.message ?? ''),
+    );
+    const shouldRefreshDocIds =
+      options.retryOnStaleDocId !== false && (staleIdentifier || Boolean(staleDocId));
+
+    if (shouldRefreshDocIds) {
+      if (this.verbose) {
+        console.debug(
+          staleIdentifier
+            ? '[graphql] stale identifier / fbtype mismatch, refreshing doc_ids…'
+            : '[graphql] stale doc_id, refreshing…',
+        );
+      }
       await this.refreshDocIds(true);
       return this.graphql(operationName, variables, {
         ...options,
@@ -399,12 +431,21 @@ export class ThreadsAPI {
   }
 
   /**
-   * Public Instagram/Threads web profile info.
+   * Public Instagram/Threads web profile info (REST-only guest path).
+   *
+   * ONLY calls `GET {host}/api/v1/users/web_profile_info/?username=` with
+   * `x-ig-app-id: 238260118697367`. Never POSTs to `/api/graphql` and never
+   * uses a GraphQL `doc_id` — guest profile reads stay on this REST endpoint.
+   *
    * Tries multiple hosts — Meta edge often 429s one host while others still work.
    * Requires HTTP/2 curl transport on many networks (HTTP/1.1 → empty 429).
    */
   async getWebProfile(username: string): Promise<WebProfileUser> {
     let lastError: ThreadsAPIError | undefined;
+    /** One forced refreshDocIds + retry when Meta returns NodeInvalidType / fbtype mismatch. */
+    let didStaleRefresh = false;
+    /** Skip backoff once after a stale-identifier heal (immediate retry). */
+    let skipBackoffOnce = false;
 
     for (const host of WEB_PROFILE_HOSTS) {
       const url = `${host}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
@@ -418,7 +459,11 @@ export class ThreadsAPI {
 
       for (let attempt = 0; attempt < 2; attempt++) {
         if (attempt > 0) {
-          await new Promise((r) => setTimeout(r, 1500 * attempt));
+          if (skipBackoffOnce) {
+            skipBackoffOnce = false;
+          } else {
+            await new Promise((r) => setTimeout(r, 1500 * attempt));
+          }
         }
 
         let res: Response;
@@ -510,10 +555,20 @@ export class ThreadsAPI {
         if (!json?.data?.user) {
           const upstreamMessage = json?.message;
           const headerMismatch = /useragent mismatch/i.test(String(upstreamMessage ?? ''));
+          // Prefer body classification so NodeInvalidType / fbtype mismatch is not
+          // reported as missing_user or (later) as an IP block.
+          const classified =
+            upstream === 'stale_identifier' || looksLikeStaleIdentifier(text)
+              ? 'stale_identifier'
+              : looksLikeStaleIdentifier(String(upstreamMessage ?? ''))
+                ? 'stale_identifier'
+                : 'missing_user';
           lastError = new ThreadsAPIError(
             headerMismatch
               ? `web_profile_info rejected headers for @${username} on ${host}: ${upstreamMessage}`
-              : `Failed to fetch web profile for @${username} on ${host}`,
+              : classified === 'stale_identifier'
+                ? `web_profile_info returned stale identifier for @${username} on ${host}`
+                : `Failed to fetch web profile for @${username} on ${host}`,
             {
               message: upstreamMessage,
               status: json?.status,
@@ -521,7 +576,7 @@ export class ThreadsAPI {
             },
             res.status || 404,
             {
-              upstream: 'missing_user',
+              upstream: classified,
               transport,
               details: {
                 username,
@@ -532,7 +587,26 @@ export class ThreadsAPI {
               },
             },
           );
-          if (headerMismatch || res.status === 400 || res.status === 404) break;
+          // Self-heal once: refresh cached doc_ids, then retry this host (and keep
+          // going if still stale). GraphQL paths also refresh on the same pattern.
+          if (classified === 'stale_identifier' && !didStaleRefresh) {
+            didStaleRefresh = true;
+            if (this.verbose) {
+              console.debug(
+                '[web_profile] stale identifier / fbtype mismatch, refreshing doc_ids…',
+              );
+            }
+            try {
+              await this.refreshDocIds(true);
+            } catch {
+              // Discovery failure should not hide the original upstream error.
+            }
+            // Exactly one immediate retry on this host after heal.
+            skipBackoffOnce = true;
+            attempt = 0;
+            continue;
+          }
+          if (headerMismatch || classified === 'stale_identifier' || res.status === 400 || res.status === 404) break;
           continue;
         }
 
@@ -544,10 +618,13 @@ export class ThreadsAPI {
     }
 
     if (lastError) {
+      // Never reclassify NodeInvalidTypeException / fbtype mismatch (stale_identifier)
+      // as an IP block — HTTP 400 with that body is not rate-limiting.
       const blocked =
-        lastError.upstream === 'rate_limited' ||
-        lastError.upstream === 'empty_body' ||
-        lastError.status === 429;
+        lastError.upstream !== 'stale_identifier' &&
+        (lastError.upstream === 'rate_limited' ||
+          lastError.upstream === 'empty_body' ||
+          lastError.status === 429);
       if (blocked) {
         throw new ThreadsAPIError(
           `Failed to fetch web profile for @${username}: Meta blocked upstream requests from this server IP (common on Coolify/VPS). Set XY_PROXY to a residential proxy, or host on a home network/Raspberry Pi.`,
@@ -575,7 +652,10 @@ export class ThreadsAPI {
     });
   }
 
-  /** Normalize web profile → ThreadsUser shape. */
+  /**
+   * Guest profile lookup → REST-only via `getWebProfile` (`web_profile_info`).
+   * Server `GET /profile/:username` uses this path; it does not call GraphQL.
+   */
   async getUserProfile(usernameOrId: string): Promise<ThreadsUser> {
     const isNumeric = /^\d+$/.test(usernameOrId);
     const web = isNumeric
@@ -607,8 +687,9 @@ export class ThreadsAPI {
   }
 
   /**
-   * User profile via GraphQL (`BarcelonaUserDialogByUsernameQuery`).
-   * May require healthy guest session; falls back to web_profile_info.
+   * Explicit GraphQL profile query (`BarcelonaUserDialogByUsernameQuery`).
+   * Not used by the guest server path — prefer `getUserProfile` / `getWebProfile`
+   * (REST `web_profile_info`) for unauthenticated profile reads.
    */
   async getUserProfileGraphQL(username: string): Promise<unknown> {
     const res = await this.graphql('BarcelonaUserDialogByUsernameQuery', {

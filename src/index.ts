@@ -10,6 +10,7 @@ export {
   ThreadsAPIError,
   DocIdNotFoundError,
   classifyUpstreamBody,
+  looksLikeStaleIdentifier,
   bodyPreview,
   httpStatusForThreadsError,
   type UpstreamHint,

@@ -3,6 +3,7 @@ import {
   bodyPreview,
   classifyUpstreamBody,
   httpStatusForThreadsError,
+  looksLikeStaleIdentifier,
   ThreadsAPIError,
 } from '../src/errors.js';
 
@@ -30,6 +31,23 @@ describe('classifyUpstreamBody', () => {
 
   it('returns unknown for JSON-looking bodies', () => {
     expect(classifyUpstreamBody(200, '{"data":null}')).toBe('unknown');
+  });
+
+  it('detects NodeInvalidTypeException / fbtype mismatch as stale_identifier', () => {
+    const msg =
+      'NodeInvalidTypeException: Node backed by fbid 123 has wrong fbtype 6057, expected fbtype 64043';
+    expect(classifyUpstreamBody(400, JSON.stringify({ message: msg }))).toBe(
+      'stale_identifier',
+    );
+    expect(classifyUpstreamBody(400, msg)).toBe('stale_identifier');
+    expect(
+      classifyUpstreamBody(
+        200,
+        JSON.stringify({ errors: [{ message: 'NodeInvalidType: wrong fbtype' }] }),
+      ),
+    ).toBe('stale_identifier');
+    expect(looksLikeStaleIdentifier(msg)).toBe(true);
+    expect(looksLikeStaleIdentifier('{"data":null}')).toBe(false);
   });
 });
 
@@ -72,6 +90,14 @@ describe('ThreadsAPIError', () => {
     const err = new ThreadsAPIError('blocked', undefined, 200, {
       upstream: 'html_challenge',
       transport: 'fetch',
+    });
+    expect(httpStatusForThreadsError(err)).toBe(502);
+  });
+
+  it('maps stale_identifier to 502 (not an IP-block 429)', () => {
+    const err = new ThreadsAPIError('stale doc', undefined, 400, {
+      upstream: 'stale_identifier',
+      transport: 'curl',
     });
     expect(httpStatusForThreadsError(err)).toBe(502);
   });

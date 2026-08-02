@@ -1,0 +1,20 @@
+{
+  "BarcelonaUserDialogByUsernameQuery": "27156446060700407",
+  "BarcelonaUsernameHovercardImplDirectQuery": "28194833553463057",
+  "BarcelonaUserHovercardImplQuery": "27220712120957908",
+  "BarcelonaPostPageDirectQuery": "27871919269164889",
+  "BarcelonaPostPageContainerViewerDirectQuery": "27524608677194577",
+  "BarcelonaPostColumnPageQuery": "27617833097859154",
+  "BarcelonaFeedPaginationDirectQuery": "37463620386586907",
+  "BarcelonaAccountSearchGraphQLDataSourceQuery": "27962697876655098",
+  "BarcelonaInlineRepliesExpansionQuery": "27273566789010960",
+  "useTHLikeMutationLikeMutation": "24753372994365040",
+  "useTHLikeMutationUnlikeMutation": "24987148517646229",
+  "useTHFollowMutationFollowMutation": "26234294899535416",
+  "useTHFollowMutationUnfollowMutation": "25812542025061756",
+  "BarcelonaProfileRootQuery_legacy": "23996318473300828",
+  "BarcelonaProfileThreadsTabQuery_legacy": "6232751443445612",
+  "BarcelonaProfileRepliesTabQuery_legacy": "6307072669391286",
+  "BarcelonaPostPageQuery_legacy": "5587632691339264",
+  "BarcelonaThreadLikersQuery_legacy": "9360915773983802"
+}

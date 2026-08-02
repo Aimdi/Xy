@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.xy-doc-ids.json
+.xy-doc-ids.test.json
+discovered-doc-ids.latest.json
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage/

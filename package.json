@@ -1,0 +1,62 @@
+{
+  "name": "xy-threads-api",
+  "version": "0.1.0",
+  "description": "Unofficial, reverse-engineered Node.js/TypeScript client for Meta's Threads — updated successor to junhoyeo/threads-api, inspired by QuaX's approach to X.",
+  "author": "Aimdi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Aimdi/Xy.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "bin": {
+    "xy-threads": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src/seed-doc-ids.json",
+    "docs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/cli.ts --format esm,cjs --dts --clean",
+    "dev": "tsup src/index.ts --format esm --watch --dts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "discover-doc-ids": "tsx scripts/discover-doc-ids.ts",
+    "example:basic": "tsx examples/basic.ts",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "threads",
+    "instagram",
+    "meta",
+    "barcelona",
+    "threads-api",
+    "reverse-engineering",
+    "graphql"
+  ],
+  "dependencies": {
+    "commander": "^13.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.9"
+  }
+}

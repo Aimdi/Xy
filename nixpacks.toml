@@ -1,0 +1,8 @@
+# Fallback if Coolify uses Nixpacks instead of Dockerfile.
+# Nixpacks Node images do not include curl by default — Xy needs it for transport:'curl'.
+
+[phases.setup]
+nixPkgs = ["...", "curl"]
+
+[start]
+cmd = "node dist/server.js"

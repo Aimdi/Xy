@@ -543,14 +543,36 @@ export class ThreadsAPI {
       }
     }
 
-    throw (
-      lastError ??
-      new ThreadsAPIError(`Failed to fetch web profile for @${username}`, undefined, undefined, {
-        upstream: 'unknown',
-        transport: this.lastTransportUsed,
-        details: { username, hosts_tried: [...WEB_PROFILE_HOSTS] },
-      })
-    );
+    if (lastError) {
+      const blocked =
+        lastError.upstream === 'rate_limited' ||
+        lastError.upstream === 'empty_body' ||
+        lastError.status === 429;
+      if (blocked) {
+        throw new ThreadsAPIError(
+          `Failed to fetch web profile for @${username}: Meta blocked upstream requests from this server IP (common on Coolify/VPS). Set XY_PROXY to a residential proxy, or host on a home network/Raspberry Pi.`,
+          lastError.data,
+          lastError.status,
+          {
+            upstream: lastError.upstream ?? 'rate_limited',
+            transport: lastError.transport ?? this.lastTransportUsed,
+            details: {
+              ...(lastError.details ?? {}),
+              username,
+              hosts_tried: [...WEB_PROFILE_HOSTS],
+              hint: 'XY_PROXY / HTTPS_PROXY residential proxy, or run on Pi',
+            },
+          },
+        );
+      }
+      throw lastError;
+    }
+
+    throw new ThreadsAPIError(`Failed to fetch web profile for @${username}`, undefined, undefined, {
+      upstream: 'unknown',
+      transport: this.lastTransportUsed,
+      details: { username, hosts_tried: [...WEB_PROFILE_HOSTS] },
+    });
   }
 
   /** Normalize web profile → ThreadsUser shape. */

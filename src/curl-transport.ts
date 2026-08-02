@@ -28,11 +28,19 @@ export async function curlRequest(
     userAgent?: string;
     cookie?: string;
     timeoutSec?: number;
+    /** HTTP(S) proxy URL, e.g. http://user:pass@host:port */
+    proxy?: string;
   } = {},
 ): Promise<CurlResponse> {
   return curlRequestViaFiles(url, {
     ...options,
     method: options.method ?? (options.body ? 'POST' : 'GET'),
+    proxy:
+      options.proxy ||
+      process.env.XY_PROXY ||
+      process.env.HTTPS_PROXY ||
+      process.env.HTTP_PROXY ||
+      process.env.ALL_PROXY,
   });
 }
 
@@ -45,6 +53,7 @@ async function curlRequestViaFiles(
     userAgent?: string;
     cookie?: string;
     timeoutSec?: number;
+    proxy?: string;
   },
 ): Promise<CurlResponse> {
   const { readFileSync, mkdtempSync, rmSync } = await import('node:fs');
@@ -58,7 +67,7 @@ async function curlRequestViaFiles(
   const baseArgs = [
     '-sL',
     '--max-time',
-    String(options.timeoutSec ?? 30),
+    String(options.timeoutSec ?? 20),
     '-A',
     options.userAgent ??
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -67,6 +76,10 @@ async function curlRequestViaFiles(
     '-o',
     bodyFile,
   ];
+
+  if (options.proxy) {
+    baseArgs.push('-x', options.proxy);
+  }
 
   // Avoid `-X` for GET/HEAD: with `-L`, `-X` forces the method on every hop.
   // `--data-binary` already selects POST, so skip `-X POST` when a body is set.

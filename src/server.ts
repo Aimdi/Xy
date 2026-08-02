@@ -4,6 +4,8 @@
  *   npx tsx src/server.ts
  *   curl http://127.0.0.1:8787/health
  *   curl -H "Authorization: Bearer $XY_API_TOKEN" http://127.0.0.1:8787/profile/zuck
+ *   curl -H "Authorization: Bearer $XY_API_TOKEN" http://127.0.0.1:8787/post/CuZsgfWLyiI
+ *   curl -H "Authorization: Bearer $XY_API_TOKEN" http://127.0.0.1:8787/threads/zuck
  */
 import { spawnSync } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -76,10 +78,47 @@ function notFound(res: ServerResponse): void {
       'GET /debug/refresh-cookies',
       'GET /profile/:username',
       'GET /user-id/:username',
+      'GET /post/:postIdOrShortcodeOrUrl',
+      'GET /search/users?q=',
+      'GET /threads/:username',
+      'GET /replies/:username',
+      'GET /timeline',
       'GET /post-id/:shortcodeOrUrl',
       'GET /thread-id/:postId',
     ],
   });
+}
+
+/** Auth-gated Barcelona endpoints — clear 501 instead of a generic login throw. */
+function requireThreadsAuth(res: ServerResponse): boolean {
+  if (api.getDiagnostics().authenticated) return true;
+  send(res, 501, {
+    error: 'requires_authentication',
+    message:
+      'This endpoint requires Threads login. Set THREADS_TOKEN (Bearer IGT:2:…) or THREADS_USERNAME + THREADS_PASSWORD, then redeploy.',
+  });
+  return false;
+}
+
+/**
+ * Resolve /post/:id — numeric PK → getPost, shortcode → getPostFromThreadId,
+ * URL/path → getPostFromUrl. Matches ThreadsAPI guest GraphQL helpers only.
+ */
+async function fetchPostPayload(raw: string): Promise<unknown> {
+  const value = decodeURIComponent(raw);
+  if (/^https?:\/\//i.test(value)) {
+    return api.getPostFromUrl(value);
+  }
+  if (value.includes('/')) {
+    const asUrl = value.startsWith('/')
+      ? `https://www.threads.net${value}`
+      : `https://www.threads.net/${value}`;
+    return api.getPostFromUrl(asUrl);
+  }
+  if (/^\d+$/.test(value)) {
+    return api.getPost(value);
+  }
+  return api.getPostFromThreadId(value);
 }
 
 function sendError(res: ServerResponse, err: unknown): void {
@@ -385,6 +424,62 @@ const server = createServer(async (req, res) => {
       send(res, 200, { username: parts[1], user_id: id });
       return;
     }
+
+    // Guest GraphQL: single thread + replies (getPost / getPostFromThreadId / getPostFromUrl)
+    if (parts[0] === 'post' && parts[1]) {
+      const raw = parts.slice(1).join('/');
+      const data = await fetchPostPayload(raw);
+      send(res, 200, data);
+      return;
+    }
+
+    // Guest GraphQL: user search (searchUsers)
+    if (parts[0] === 'search' && parts[1] === 'users' && parts.length === 2) {
+      const q = url.searchParams.get('q') ?? url.searchParams.get('query') ?? '';
+      if (!q.trim()) {
+        send(res, 400, {
+          error: 'bad_request',
+          message: 'Missing query. Use GET /search/users?q=...',
+        });
+        return;
+      }
+      const first = Number(url.searchParams.get('first') ?? 10);
+      const data = await api.searchUsers(q.trim(), Number.isFinite(first) ? first : 10);
+      send(res, 200, data);
+      return;
+    }
+
+    // Auth: user profile threads (getUserProfileThreadsLoggedIn)
+    if (parts[0] === 'threads' && parts[1] && parts.length === 2) {
+      if (!requireThreadsAuth(res)) return;
+      const username = parts[1];
+      const userId = await api.getUserIdFromUsername(username);
+      const maxId = url.searchParams.get('max_id') ?? undefined;
+      const data = await api.getUserProfileThreadsLoggedIn(userId, maxId ?? undefined);
+      send(res, 200, data);
+      return;
+    }
+
+    // Auth: user profile replies (getUserProfileRepliesLoggedIn)
+    if (parts[0] === 'replies' && parts[1] && parts.length === 2) {
+      if (!requireThreadsAuth(res)) return;
+      const username = parts[1];
+      const userId = await api.getUserIdFromUsername(username);
+      const maxId = url.searchParams.get('max_id') ?? undefined;
+      const data = await api.getUserProfileRepliesLoggedIn(userId, maxId ?? undefined);
+      send(res, 200, data);
+      return;
+    }
+
+    // Auth: home timeline (getTimeline)
+    if (parts[0] === 'timeline' && parts.length === 1) {
+      if (!requireThreadsAuth(res)) return;
+      const maxId = url.searchParams.get('max_id') ?? undefined;
+      const data = await api.getTimeline(maxId ?? undefined);
+      send(res, 200, data);
+      return;
+    }
+
     if (parts[0] === 'post-id' && parts[1]) {
       const raw = decodeURIComponent(parts.slice(1).join('/'));
       const id = raw.includes('/') ? postIdFromUrl(raw) : postIdFromThreadId(raw);

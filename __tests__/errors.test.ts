@@ -101,6 +101,13 @@ describe('ThreadsAPIError', () => {
     });
     expect(httpStatusForThreadsError(err)).toBe(500);
   });
+
+  it('maps authentication-required errors to 501', () => {
+    const err = new ThreadsAPIError(
+      'Authentication required. Set token or call login() with username/password.',
+    );
+    expect(httpStatusForThreadsError(err)).toBe(501);
+  });
 });
 
 describe('bodyPreview', () => {

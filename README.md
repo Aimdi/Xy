@@ -90,6 +90,15 @@ Short version:
 3. **Guest REST** — `web_profile_info` remains the most reliable unauthenticated profile read
 4. **Mobile** — `i.instagram.com/api/v1/text_feed/...` (Barcelona UA) for timelines, publish, social actions
 
+## Raspberry Pi (auto-start on boot)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Aimdi/Xy/main/deploy/install-pi.sh | bash
+curl http://127.0.0.1:8787/profile/zuck
+```
+
+Full guide: [docs/RASPBERRY_PI.md](./docs/RASPBERRY_PI.md)
+
 ## Scripts
 
 ```bash

@@ -1,0 +1,24 @@
+[Unit]
+Description=Xy Threads API (local HTTP server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/Xy
+Environment=NODE_ENV=production
+Environment=XY_HOST=127.0.0.1
+Environment=XY_PORT=8787
+EnvironmentFile=-/home/%i/Xy/.env
+ExecStart=/usr/bin/npm run server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening (safe defaults for a local API)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

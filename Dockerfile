@@ -38,6 +38,6 @@ EXPOSE 8787
 
 # Shell form so Coolify-injected PORT is honored at runtime.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD-SHELL curl -fsS "http://127.0.0.1:$${PORT:-$${XY_PORT:-8787}}/health" || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT:-${XY_PORT:-8787}}/health" || exit 1
 
 CMD ["node", "dist/server.js"]

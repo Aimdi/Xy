@@ -24,23 +24,10 @@ export async function curlRequest(
     timeoutSec?: number;
   } = {},
 ): Promise<CurlResponse> {
-  const method = options.method ?? (options.body ? 'POST' : 'GET');
-  const args = [
-    '-sL',
-    '-X',
-    method,
-    '-A',
-    options.userAgent ??
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    '-D',
-    '-', // dump headers to stdout before body
-    '-o',
-    '-', // body to stdout after headers... actually -D - mixes; use separate
-  ];
-
-  // Use a cleaner approach: write headers to fd3 via -w / -D tempfile is easier
-  // We'll use -w for status and -D for headers file via stdout split with --raw
-  return curlRequestViaFiles(url, { ...options, method });
+  return curlRequestViaFiles(url, {
+    ...options,
+    method: options.method ?? (options.body ? 'POST' : 'GET'),
+  });
 }
 
 async function curlRequestViaFiles(

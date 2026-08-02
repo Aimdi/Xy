@@ -5,9 +5,9 @@
 Two separate issues hit Coolify deploys:
 
 1. **Missing `curl` in the Node image** — Xy shells out to system curl with HTTP/2. Plain Nixpacks / `node:*-slim` images often have no curl → profile fetches die.
-2. **EU consent gating (geo)** — US egress works cold; German/EU hosts often get HTTP 400 `NodeInvalidTypeException` / fbtype mismatch on `web_profile_info` when called **without** browser session cookies. This is **not** a datacenter IP block and **not** a stale doc_id. Xy now keeps a curl cookie jar (`XY_COOKIE_JAR`) warmed from Threads HTML.
+2. **EU consent gating (geo)** — US egress works cold; German/EU hosts often get HTTP 400 `NodeInvalidTypeException` / fbtype mismatch on `web_profile_info` when called **without** browser session cookies. This is **not** a datacenter IP block and **not** a stale doc_id. Xy warms a curl cookie jar (`XY_COOKIE_JAR`) from **Instagram + Threads** HTML so the jar accumulates `mid` / `ig_did` / `ig_nrcb` / `csrftoken` (Threads alone only sets csrftoken).
 
-A US VPS proxy (`XY_PROXY`) remains a solid fallback if the cookie jar alone is not enough.
+A US VPS proxy (`XY_PROXY`) remains the reliable fallback if EU still rejects after a full warm (`consent_ready: true` in `/health`).
 
 ## Fix: redeploy with the repo Dockerfile
 

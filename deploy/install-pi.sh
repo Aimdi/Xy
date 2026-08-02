@@ -32,6 +32,14 @@ if ! need_cmd curl; then
   sudo apt-get install -y curl
 fi
 
+# Meta empty-429s HTTP/1.1; Xy requires curl with HTTP/2 (nghttp2).
+if ! curl -V 2>&1 | grep -qiE 'HTTP2|nghttp2'; then
+  echo "==> WARNING: curl lacks HTTP/2 support."
+  echo "    Profile fetches will fail with empty HTTP 429."
+  echo "    Try: sudo apt-get install -y curl"
+  echo "    Then verify: curl -V | grep -i HTTP2"
+fi
+
 if ! need_cmd node || ! need_cmd npm; then
   echo "==> Installing Node.js ${NODE_MAJOR}.x"
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -

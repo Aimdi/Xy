@@ -97,6 +97,52 @@ cd ~/Xy
 npm run server
 ```
 
+## Troubleshooting: `Failed to fetch web profile`
+
+### 1. Pull the latest fix
+
+```bash
+cd ~/Xy
+git pull
+npm install
+sudo systemctl restart xy-threads@$USER
+curl http://127.0.0.1:8787/profile/zuck
+```
+
+### 2. Check curl has HTTP/2
+
+Meta returns **empty HTTP 429** when the request is HTTP/1.1:
+
+```bash
+curl -V | grep -i HTTP2
+# should mention HTTP2 / nghttp2
+
+# This should fail (proves the issue):
+curl --http1.1 -s -o /dev/null -w '%{http_code}\n' \
+  -H 'x-ig-app-id: 238260118697367' \
+  'https://www.threads.net/api/v1/users/web_profile_info/?username=zuck'
+# → 429
+
+# This should work:
+curl --http2 -s \
+  -H 'x-ig-app-id: 238260118697367' \
+  'https://www.threads.net/api/v1/users/web_profile_info/?username=zuck' | head -c 80
+```
+
+If HTTP/2 is missing:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y curl
+```
+
+### 3. Inspect server diagnostics
+
+```bash
+curl http://127.0.0.1:8787/debug/ping
+sudo journalctl -u xy-threads@$USER -n 50 --no-pager
+```
+
 ## Uninstall
 
 ```bash

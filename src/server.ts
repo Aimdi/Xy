@@ -3,10 +3,15 @@
  *
  *   npx tsx src/server.ts
  *   curl http://127.0.0.1:8787/health
+ *   curl http://127.0.0.1:8787/debug/ping
  *   curl http://127.0.0.1:8787/profile/zuck
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { ThreadsAPI } from './client.js';
+import {
+  httpStatusForThreadsError,
+  ThreadsAPIError,
+} from './errors.js';
 import { postIdFromThreadId, postIdFromUrl, threadIdFromPostId } from './utils.js';
 
 const HOST = process.env.XY_HOST ?? '0.0.0.0';
@@ -21,6 +26,7 @@ const api = new ThreadsAPI({
   token: process.env.THREADS_TOKEN,
   deviceId: process.env.THREADS_DEVICE_ID,
   userId: process.env.THREADS_USER_ID,
+  transport: (process.env.XY_TRANSPORT as 'curl' | 'fetch' | 'auto' | undefined) ?? 'curl',
 });
 
 function send(res: ServerResponse, status: number, body: unknown): void {
@@ -44,12 +50,46 @@ function notFound(res: ServerResponse): void {
     error: 'not_found',
     endpoints: [
       'GET /health',
+      'GET /debug/ping',
       'GET /profile/:username',
       'GET /user-id/:username',
       'GET /post-id/:shortcodeOrUrl',
       'GET /thread-id/:postId',
     ],
   });
+}
+
+function sendError(res: ServerResponse, err: unknown): void {
+  if (err instanceof ThreadsAPIError) {
+    send(res, httpStatusForThreadsError(err), {
+      ...err.toJSON(),
+      // Ensure transport is present even on older-style throws
+      transport: err.transport ?? api.getDiagnostics().last_transport,
+    });
+    return;
+  }
+
+  const message = err instanceof Error ? err.message : String(err);
+  send(res, 500, {
+    error: 'internal_error',
+    message,
+    transport: api.getDiagnostics().last_transport,
+  });
+}
+
+/** Health / debug payload — never includes LSD value, cookies, or credentials. */
+function diagnosticsPayload() {
+  const d = api.getDiagnostics();
+  return {
+    transport: d.transport,
+    last_transport: d.last_transport,
+    lsd: {
+      present: d.lsd_present,
+      is_default: d.lsd_is_default,
+    },
+    has_cookies: d.has_cookies,
+    authenticated: d.authenticated,
+  };
 }
 
 async function readUrl(req: IncomingMessage): Promise<URL> {
@@ -73,6 +113,17 @@ const server = createServer(async (req, res) => {
         host: HOST,
         port: PORT,
         time: new Date().toISOString(),
+        ...diagnosticsPayload(),
+      });
+      return;
+    }
+
+    if (parts[0] === 'debug' && parts[1] === 'ping' && parts.length === 2) {
+      send(res, 200, {
+        ok: true,
+        ping: 'pong',
+        time: new Date().toISOString(),
+        ...diagnosticsPayload(),
       });
       return;
     }
@@ -106,8 +157,7 @@ const server = createServer(async (req, res) => {
     }
     notFound(res);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    send(res, 500, { error: 'internal_error', message });
+    sendError(res, err);
   }
 });
 

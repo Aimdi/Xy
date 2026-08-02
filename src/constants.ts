@@ -5,8 +5,22 @@ export const WEB_IG_APP_ID = '238260118697367';
 export const ANDROID_IG_APP_ID = '3419628305025917';
 
 export const THREADS_BASE_URL = 'https://www.threads.net';
-export const THREADS_GRAPHQL_URL = `${THREADS_BASE_URL}/api/graphql`;
+/** Canonical www host after Threads → Instagram migration redirects. */
+export const THREADS_WWW_URL = 'https://www.threads.com';
+export const THREADS_GRAPHQL_URL = `${THREADS_WWW_URL}/api/graphql`;
 export const INSTAGRAM_API_URL = 'https://i.instagram.com';
+export const INSTAGRAM_WWW_URL = 'https://www.instagram.com';
+
+/**
+ * Hosts that currently serve guest `web_profile_info` for Threads usernames.
+ * Fail over across these when one edge returns 429 / challenge / empty body.
+ */
+export const WEB_PROFILE_HOSTS = [
+  THREADS_BASE_URL,
+  THREADS_WWW_URL,
+  INSTAGRAM_WWW_URL,
+  INSTAGRAM_API_URL,
+] as const;
 
 /** Fallback LSD token — always refresh from a live page when possible. */
 export const DEFAULT_LSD_TOKEN = 'NjppQDEgONsU_1LCzrmp6q';

@@ -6,7 +6,16 @@ export {
   resolveOperationDocId,
   type DocIdDiscoveryOptions,
 } from './doc-id-discovery.js';
-export { ThreadsAPIError, DocIdNotFoundError } from './errors.js';
+export {
+  ThreadsAPIError,
+  DocIdNotFoundError,
+  classifyUpstreamBody,
+  bodyPreview,
+  httpStatusForThreadsError,
+  type UpstreamHint,
+  type TransportKind,
+  type ThreadsAPIErrorMeta,
+} from './errors.js';
 export * from './types.js';
 export * from './constants.js';
 export {

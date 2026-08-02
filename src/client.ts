@@ -8,9 +8,17 @@ import {
   INSTAGRAM_API_URL,
   THREADS_BASE_URL,
   THREADS_GRAPHQL_URL,
+  THREADS_WWW_URL,
   WEB_IG_APP_ID,
+  WEB_PROFILE_HOSTS,
 } from './constants.js';
-import { DocIdNotFoundError, ThreadsAPIError } from './errors.js';
+import {
+  bodyPreview,
+  classifyUpstreamBody,
+  DocIdNotFoundError,
+  ThreadsAPIError,
+  type TransportKind,
+} from './errors.js';
 import {
   DocIdRegistry,
   resolveOperationDocId,
@@ -26,7 +34,6 @@ import type {
 } from './types.js';
 import {
   extractLsdToken,
-  extractUserIdFromHtml,
   generateDeviceId,
   mergeCookies,
   parseSetCookie,
@@ -85,7 +92,10 @@ export class ThreadsAPI {
 
   readonly docIds: DocIdRegistry;
   private readonly fetchImpl: typeof fetch;
-  private transport: HttpTransport;
+  /** Configured transport mode (`curl` | `fetch` | `auto`). */
+  readonly transport: HttpTransport;
+  /** Last concrete transport that actually ran a request. */
+  private lastTransportUsed: TransportKind;
 
   constructor(options: ThreadsAPIOptions = {}) {
     this.username = options.username ?? process.env.THREADS_USERNAME;
@@ -100,6 +110,7 @@ export class ThreadsAPI {
     this.userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
     this.locale = options.locale ?? 'en-US';
     this.transport = options.transport ?? 'curl';
+    this.lastTransportUsed = this.transport === 'fetch' ? 'fetch' : 'curl';
     this.fetchImpl =
       options.fetchImpl ??
       (this.transport === 'fetch' ? fetch : createCurlFetch(this.userAgent));
@@ -116,6 +127,29 @@ export class ThreadsAPI {
     }
   }
 
+  /**
+   * Safe runtime diagnostics for /health and /debug/ping.
+   * Never includes LSD token, cookies, passwords, or auth headers.
+   */
+  getDiagnostics(): {
+    transport: HttpTransport;
+    last_transport: TransportKind;
+    lsd_present: boolean;
+    lsd_is_default: boolean;
+    has_cookies: boolean;
+    authenticated: boolean;
+  } {
+    const lsdIsDefault = !this.fbLsdToken || this.fbLsdToken === DEFAULT_LSD_TOKEN;
+    return {
+      transport: this.transport,
+      last_transport: this.lastTransportUsed,
+      lsd_present: Boolean(this.fbLsdToken),
+      lsd_is_default: lsdIsDefault,
+      has_cookies: Boolean(this.cookie && this.cookie.length > 0),
+      authenticated: Boolean(this.token),
+    };
+  }
+
   // ---------------------------------------------------------------------------
   // Low-level HTTP
   // ---------------------------------------------------------------------------
@@ -129,6 +163,7 @@ export class ThreadsAPI {
       return this.rawCurl(url, init, headers);
     }
 
+    this.lastTransportUsed = 'fetch';
     const res = await this.fetchImpl(url, { ...init, headers });
     this.captureCookiesFromFetch(res);
 
@@ -144,10 +179,15 @@ export class ThreadsAPI {
   }
 
   private async rawCurl(url: string, init: RequestInit, headers: Headers): Promise<Response> {
+    this.lastTransportUsed = 'curl';
     const headerObj: Record<string, string> = {};
     headers.forEach((v, k) => {
       headerObj[k] = v;
     });
+    // Prefer a single Cookie header via curlRequest's `cookie` option (avoids duplicates).
+    const cookie = this.cookie || headerObj.cookie || undefined;
+    delete headerObj.cookie;
+
     const method = (init.method ?? 'GET').toUpperCase();
     let body: string | undefined;
     if (init.body != null) {
@@ -158,17 +198,21 @@ export class ThreadsAPI {
       headers: headerObj,
       body,
       userAgent: this.userAgent,
-      cookie: this.cookie || undefined,
+      cookie,
     });
     if (curlRes.headers['set-cookie']) {
       const parts = curlRes.headers['set-cookie'].split('\n').filter(Boolean);
       this.cookie = mergeCookies(this.cookie, parseSetCookie(parts));
     }
-    // Response headers cannot contain raw Set-Cookie multi-values with newlines
+    // Response headers cannot contain raw Set-Cookie multi-values with newlines;
+    // status 0 would throw in `new Response` — clamp to a valid gateway error.
+    const status =
+      curlRes.status >= 200 && curlRes.status <= 599 ? curlRes.status : 502;
     const safeHeaders: Record<string, string> = { ...curlRes.headers };
     delete safeHeaders['set-cookie'];
+    if (curlRes.httpVersion) safeHeaders['x-xy-http-version'] = curlRes.httpVersion;
     return new Response(curlRes.body, {
-      status: curlRes.status,
+      status,
       headers: safeHeaders,
     });
   }
@@ -190,8 +234,8 @@ export class ThreadsAPI {
       accept: '*/*',
       'accept-language': `${this.locale},${this.locale.split('-')[0]};q=0.9`,
       'content-type': 'application/x-www-form-urlencoded',
-      origin: THREADS_BASE_URL,
-      referer: `${THREADS_BASE_URL}/`,
+      origin: THREADS_WWW_URL,
+      referer: `${THREADS_WWW_URL}/`,
       'sec-fetch-site': 'same-origin',
       'sec-fetch-mode': 'cors',
       'sec-fetch-dest': 'empty',
@@ -219,9 +263,9 @@ export class ThreadsAPI {
   // Session / tokens
   // ---------------------------------------------------------------------------
 
-  /** Fetch a fresh LSD token (and cookies) from threads.net. */
+  /** Fetch a fresh LSD token (and cookies) from threads.com. */
   async refreshLsd(username = 'zuck'): Promise<string> {
-    const res = await this.rawFetch(`${THREADS_BASE_URL}/@${username}`, {
+    const res = await this.rawFetch(`${THREADS_WWW_URL}/@${username}`, {
       headers: {
         accept: 'text/html,application/xhtml+xml',
         'user-agent': this.userAgent,
@@ -230,10 +274,20 @@ export class ThreadsAPI {
     const html = await res.text();
     const token = extractLsdToken(html);
     if (!token) {
-      throw new ThreadsAPIError('Failed to extract LSD token from Threads HTML', html.slice(0, 500));
+      const upstream = classifyUpstreamBody(res.status, html);
+      throw new ThreadsAPIError(
+        'Failed to extract LSD token from Threads HTML',
+        bodyPreview(html, 500),
+        res.status,
+        {
+          upstream: upstream === 'unknown' ? 'html_challenge' : upstream,
+          transport: this.lastTransportUsed,
+          details: { endpoint: 'threads_html' },
+        },
+      );
     }
     if (!this.noUpdateLsd) this.fbLsdToken = token;
-    if (this.verbose) console.debug('[lsd] refreshed', this.fbLsdToken);
+    if (this.verbose) console.debug('[lsd] refreshed');
     return token;
   }
 
@@ -286,8 +340,13 @@ export class ThreadsAPI {
     if (text.trimStart().startsWith('<!DOCTYPE') || text.trimStart().startsWith('<html')) {
       throw new ThreadsAPIError(
         `GraphQL returned HTML (likely rate-limited or challenged). HTTP ${res.status}`,
-        text.slice(0, 300),
+        bodyPreview(text, 300),
         res.status,
+        {
+          upstream: classifyUpstreamBody(res.status, text),
+          transport: this.lastTransportUsed,
+          details: { operation: operationName },
+        },
       );
     }
 
@@ -295,7 +354,17 @@ export class ThreadsAPI {
     try {
       json = JSON.parse(text) as GraphQLResponse<T>;
     } catch {
-      throw new ThreadsAPIError(`Failed to parse GraphQL JSON (HTTP ${res.status})`, text.slice(0, 300), res.status);
+      const upstream = classifyUpstreamBody(res.status, text);
+      throw new ThreadsAPIError(
+        `Failed to parse GraphQL JSON (HTTP ${res.status})`,
+        bodyPreview(text, 300),
+        res.status,
+        {
+          upstream: upstream === 'unknown' ? 'parse_error' : upstream,
+          transport: this.lastTransportUsed,
+          details: { operation: operationName },
+        },
+      );
     }
 
     // Self-heal: if Meta rotated the doc_id, refresh and retry once
@@ -321,86 +390,167 @@ export class ThreadsAPI {
   // ---------------------------------------------------------------------------
 
   /**
-   * Resolve a username → user id.
-   * Prefers the stable `web_profile_info` endpoint; falls back to HTML scrape.
+   * Resolve a username → Instagram/web_profile user id (e.g. zuck → 314216).
+   * Uses multi-host web_profile_info. HTML no longer embeds user_id for guests.
    */
   async getUserIdFromUsername(username: string): Promise<string> {
-    try {
-      const profile = await this.getWebProfile(username);
-      return profile.id;
-    } catch (err) {
-      if (this.verbose) console.debug('[user-id] web_profile failed, trying HTML', err);
-    }
-
-    const res = await this.rawFetch(`${THREADS_BASE_URL}/@${username}`, {
-      headers: { accept: 'text/html', 'user-agent': this.userAgent },
-    });
-    const html = await res.text();
-    const token = extractLsdToken(html);
-    if (token && !this.noUpdateLsd) this.fbLsdToken = token;
-    const userId = extractUserIdFromHtml(html);
-    if (!userId) {
-      throw new ThreadsAPIError(`Could not resolve user id for @${username}`);
-    }
-    return userId;
+    const profile = await this.getWebProfile(username);
+    return String(profile.id);
   }
 
   /**
    * Public Instagram/Threads web profile info.
-   * Reliable guest endpoint as of 2026 — does not require GraphQL doc_ids.
+   * Tries multiple hosts — Meta edge often 429s one host while others still work.
+   * Requires HTTP/2 curl transport on many networks (HTTP/1.1 → empty 429).
    */
   async getWebProfile(username: string): Promise<WebProfileUser> {
-    // web_profile_info works with just x-ig-app-id; skip LSD bootstrap to avoid
-    // burning the guest rate limit on an extra HTML fetch.
-    const url = `${THREADS_BASE_URL}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
+    let lastError: ThreadsAPIError | undefined;
 
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      if (attempt > 0) {
-        await new Promise((r) => setTimeout(r, 2000 * 2 ** (attempt - 1)));
+    for (const host of WEB_PROFILE_HOSTS) {
+      const url = `${host}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
+      const origin = host.includes('instagram.com') && !host.startsWith('https://i.')
+        ? host
+        : host.startsWith('https://i.')
+          ? INSTAGRAM_API_URL
+          : host.includes('threads.com')
+            ? THREADS_WWW_URL
+            : THREADS_BASE_URL;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, 1500 * attempt));
+        }
+
+        let res: Response;
+        try {
+          res = await this.rawFetch(url, {
+            headers: {
+              accept: '*/*',
+              'user-agent': this.userAgent,
+              'x-ig-app-id': WEB_IG_APP_ID,
+              'x-asbd-id': DEFAULT_ASBD_ID,
+              referer: `${origin}/`,
+              origin,
+            },
+          });
+        } catch (err) {
+          lastError = new ThreadsAPIError(
+            err instanceof Error ? err.message : String(err),
+            undefined,
+            undefined,
+            {
+              upstream: 'unknown',
+              transport: this.lastTransportUsed,
+              details: { username, host, attempt: attempt + 1 },
+            },
+          );
+          // curl missing HTTP/2 — don't keep hammering
+          if (/HTTP\/2|nghttp2/i.test(lastError.message)) break;
+          continue;
+        }
+
+        const text = await res.text();
+        const transport = this.lastTransportUsed;
+        const upstream = classifyUpstreamBody(res.status, text);
+        const curlHint = res.headers.get('x-xy-curl-hint') ?? undefined;
+        const httpVersion = res.headers.get('x-xy-http-version') ?? undefined;
+        const retryable =
+          res.status === 429 ||
+          upstream === 'rate_limited' ||
+          upstream === 'empty_body' ||
+          upstream === 'html_challenge' ||
+          upstream === 'non_json';
+
+        if (retryable) {
+          lastError = new ThreadsAPIError(
+            curlHint
+              ? `web_profile_info failed for @${username} on ${host} (HTTP ${res.status}, ${upstream}): ${curlHint}`
+              : `web_profile_info failed for @${username} on ${host} (HTTP ${res.status}, ${upstream})`,
+            bodyPreview(text, 300),
+            res.status,
+            {
+              upstream,
+              transport,
+              details: {
+                username,
+                host,
+                attempt: attempt + 1,
+                body_len: text.length,
+                http_version: httpVersion,
+                curl_hint: curlHint,
+              },
+            },
+          );
+          // Empty HTTP/1.1 429 won't recover on same host/transport
+          if (curlHint) break;
+          continue;
+        }
+
+        let json: {
+          data?: { user?: WebProfileUser };
+          message?: string;
+          status?: string;
+        };
+        try {
+          json = JSON.parse(text);
+        } catch {
+          lastError = new ThreadsAPIError(
+            `web_profile_info returned unparseable body for @${username} on ${host}`,
+            bodyPreview(text, 300),
+            res.status,
+            {
+              upstream: 'parse_error',
+              transport,
+              details: { username, host, attempt: attempt + 1, body_len: text.length },
+            },
+          );
+          continue;
+        }
+
+        if (!json?.data?.user) {
+          const upstreamMessage = json?.message;
+          const headerMismatch = /useragent mismatch/i.test(String(upstreamMessage ?? ''));
+          lastError = new ThreadsAPIError(
+            headerMismatch
+              ? `web_profile_info rejected headers for @${username} on ${host}: ${upstreamMessage}`
+              : `Failed to fetch web profile for @${username} on ${host}`,
+            {
+              message: upstreamMessage,
+              status: json?.status,
+              has_data: Boolean(json?.data),
+            },
+            res.status || 404,
+            {
+              upstream: 'missing_user',
+              transport,
+              details: {
+                username,
+                host,
+                attempt: attempt + 1,
+                upstream_message: upstreamMessage,
+                http_version: httpVersion,
+              },
+            },
+          );
+          if (headerMismatch || res.status === 400 || res.status === 404) break;
+          continue;
+        }
+
+        if (this.verbose) {
+          console.debug('[web_profile] ok', username, 'via', host, 'id=', json.data.user.id);
+        }
+        return json.data.user;
       }
-      const res = await this.rawFetch(url, {
-        headers: {
-          accept: '*/*',
-          'user-agent': this.userAgent,
-          'x-ig-app-id': WEB_IG_APP_ID,
-          'x-asbd-id': DEFAULT_ASBD_ID,
-          referer: `${THREADS_BASE_URL}/`,
-        },
-      });
-      const text = await res.text();
-      if (res.status === 429 || !text || text.trimStart().startsWith('<!DOCTYPE') || text.trimStart().startsWith('<html')) {
-        lastError = new ThreadsAPIError(
-          `web_profile_info returned non-JSON (HTTP ${res.status})`,
-          text.slice(0, 300),
-          res.status,
-        );
-        continue;
-      }
-      let json: {
-        data?: { user?: WebProfileUser };
-        message?: string;
-        status?: string;
-      };
-      try {
-        json = JSON.parse(text);
-      } catch (err) {
-        lastError = err;
-        continue;
-      }
-      if (!json?.data?.user) {
-        lastError = new ThreadsAPIError(
-          `Failed to fetch web profile for @${username}`,
-          json,
-          res.status,
-        );
-        continue;
-      }
-      return json.data.user;
     }
-    throw lastError instanceof Error
-      ? lastError
-      : new ThreadsAPIError(`Failed to fetch web profile for @${username}`, lastError);
+
+    throw (
+      lastError ??
+      new ThreadsAPIError(`Failed to fetch web profile for @${username}`, undefined, undefined, {
+        upstream: 'unknown',
+        transport: this.lastTransportUsed,
+        details: { username, hosts_tried: [...WEB_PROFILE_HOSTS] },
+      })
+    );
   }
 
   /** Normalize web profile → ThreadsUser shape. */

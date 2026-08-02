@@ -53,6 +53,8 @@ Edit `~/Xy/.env` if needed:
 XY_HOST=127.0.0.1
 XY_PORT=8787
 XY_VERBOSE=0
+XY_COOKIE_JAR=.xy-cookies.txt
+XY_DOC_ID_CACHE=.xy-doc-ids.json
 
 # Optional authenticated endpoints later:
 # THREADS_USERNAME=

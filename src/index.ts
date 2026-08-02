@@ -26,5 +26,8 @@ export {
   postIdFromUrl,
   extractLsdToken,
   signPayload,
+  parseNetscapeCookieJar,
+  cookieJarDiagnostics,
+  readCookieJarFile,
 } from './utils.js';
 export { curlRequest, createCurlFetch } from './curl-transport.js';

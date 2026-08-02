@@ -14,7 +14,7 @@ import {
   httpStatusForThreadsError,
   ThreadsAPIError,
 } from './errors.js';
-import { postIdFromThreadId, postIdFromUrl, threadIdFromPostId } from './utils.js';
+import { postIdFromThreadId, postIdFromUrl, readCookieJarFile, threadIdFromPostId } from './utils.js';
 
 const HOST = process.env.XY_HOST ?? '0.0.0.0';
 const PORT = Number(process.env.XY_PORT ?? process.env.PORT ?? 8787);
@@ -23,6 +23,7 @@ const API_TOKEN = process.env.XY_API_TOKEN;
 const api = new ThreadsAPI({
   verbose: process.env.XY_VERBOSE === '1',
   docIdCachePath: process.env.XY_DOC_ID_CACHE ?? '.xy-doc-ids.json',
+  cookieJarPath: process.env.XY_COOKIE_JAR ?? '.xy-cookies.txt',
   username: process.env.THREADS_USERNAME,
   password: process.env.THREADS_PASSWORD,
   token: process.env.THREADS_TOKEN,
@@ -55,6 +56,7 @@ function notFound(res: ServerResponse): void {
       'GET /debug/ping',
       'GET /debug/upstream?username=zuck',
       'GET /debug/refresh-doc-ids',
+      'GET /debug/refresh-cookies',
       'GET /profile/:username',
       'GET /user-id/:username',
       'GET /post-id/:shortcodeOrUrl',
@@ -123,6 +125,7 @@ function diagnosticsPayload() {
       is_default: d.lsd_is_default,
     },
     has_cookies: d.has_cookies,
+    cookie_jar: d.cookie_jar,
     authenticated: d.authenticated,
     runtime: curlRuntimeInfo(),
   };
@@ -184,8 +187,9 @@ function adviceForUpstreamResults(
         : String(first.body_preview ?? 'JSON error body').trim();
     return (
       `Upstream returned HTTP ${first.status} with a JSON error ` +
-      `(${msg}). This usually means a stale identifier (doc_id / fbtype mismatch), ` +
-      `not an IP block. Try GET /debug/refresh-doc-ids, then retry.`
+      `(${msg}). On EU hosts this is often consent gating (cold jar) rather than an ` +
+      `IP block — try GET /debug/refresh-cookies, then /debug/refresh-doc-ids, then retry. ` +
+      `If that fails, set XY_PROXY to a US egress proxy.`
     );
   }
 
@@ -219,6 +223,16 @@ function adviceForUpstreamResults(
 async function debugUpstream(username: string) {
   const runtime = curlRuntimeInfo();
   const results: Array<Record<string, unknown>> = [];
+  const jarPath = api.cookieJarPath || process.env.XY_COOKIE_JAR || '.xy-cookies.txt';
+
+  // Match production client behavior: warm jar before probing web_profile_info.
+  try {
+    await api.warmCookieJar();
+  } catch {
+    // still probe; advice will reflect failures
+  }
+
+  const csrf = readCookieJarFile(jarPath).get('csrftoken');
 
   for (const host of WEB_PROFILE_HOSTS) {
     const url = `${host}/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
@@ -228,7 +242,9 @@ async function debugUpstream(username: string) {
           accept: '*/*',
           'x-ig-app-id': WEB_IG_APP_ID,
           referer: `${host}/`,
+          ...(csrf ? { 'x-csrftoken': csrf } : {}),
         },
+        cookieJarPath: jarPath,
         timeoutSec: 15,
         proxy:
           process.env.XY_PROXY ||
@@ -269,6 +285,7 @@ async function debugUpstream(username: string) {
     ok: anyOk,
     username,
     runtime,
+    cookie_jar: api.getDiagnostics().cookie_jar,
     results,
     advice: adviceForUpstreamResults(results, runtime, Boolean(anyOk)),
   };
@@ -326,6 +343,17 @@ const server = createServer(async (req, res) => {
         ok: true,
         count: Object.keys(docIds).length,
         doc_ids: docIds,
+        cookie_jar: api.getDiagnostics().cookie_jar,
+      });
+      return;
+    }
+
+    if (parts[0] === 'debug' && parts[1] === 'refresh-cookies' && parts.length === 2) {
+      await api.warmCookieJar(true);
+      send(res, 200, {
+        ok: true,
+        cookie_jar: api.getDiagnostics().cookie_jar,
+        has_cookies: api.getDiagnostics().has_cookies,
       });
       return;
     }

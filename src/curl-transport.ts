@@ -8,6 +8,28 @@ export interface CurlResponse {
   httpVersion?: string;
 }
 
+export interface CurlRequestOptions {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  userAgent?: string;
+  /** Raw Cookie header (used when no jar, or as an extra override). */
+  cookie?: string;
+  /**
+   * Netscape cookie jar path for curl `--cookie` / `--cookie-jar`.
+   * Persists EU consent cookies (datr/mid/ig_did/csrftoken) across requests.
+   */
+  cookieJarPath?: string;
+  timeoutSec?: number;
+  /** HTTP(S) proxy URL, e.g. http://user:pass@host:port */
+  proxy?: string;
+}
+
+export interface CurlFetchOptions {
+  userAgent?: string;
+  cookieJarPath?: string;
+}
+
 /**
  * Browser-like requests via system curl.
  *
@@ -18,19 +40,14 @@ export interface CurlResponse {
  * Important: Meta's edge also empty-429s plain HTTP/1.1 curl. Prefer HTTP/2
  * (ALPN). Raspberry Pi builds of curl without nghttp2 will fail closed with a
  * clear error instead of looking like a random profile miss.
+ *
+ * EU hosts often need a warmed cookie jar: a real browser picks up Set-Cookie
+ * from the first HTML load and sends those cookies on web_profile_info. Cold
+ * calls without a jar are exactly what EU consent gating rejects.
  */
 export async function curlRequest(
   url: string,
-  options: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-    userAgent?: string;
-    cookie?: string;
-    timeoutSec?: number;
-    /** HTTP(S) proxy URL, e.g. http://user:pass@host:port */
-    proxy?: string;
-  } = {},
+  options: CurlRequestOptions = {},
 ): Promise<CurlResponse> {
   return curlRequestViaFiles(url, {
     ...options,
@@ -46,15 +63,7 @@ export async function curlRequest(
 
 async function curlRequestViaFiles(
   url: string,
-  options: {
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-    userAgent?: string;
-    cookie?: string;
-    timeoutSec?: number;
-    proxy?: string;
-  },
+  options: CurlRequestOptions,
 ): Promise<CurlResponse> {
   const { readFileSync, mkdtempSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
@@ -91,16 +100,23 @@ async function curlRequestViaFiles(
     baseArgs.push('-X', method);
   }
 
-  if (options.cookie) {
+  // Native curl cookie engine — persists consent cookies across redirects/restarts.
+  // When a jar is configured it is the sole cookie source (no extra Cookie header).
+  if (options.cookieJarPath) {
+    baseArgs.push('--cookie', options.cookieJarPath);
+    baseArgs.push('--cookie-jar', options.cookieJarPath);
+  } else if (options.cookie) {
     baseArgs.push('-H', `Cookie: ${options.cookie}`);
   }
+
   for (const [k, v] of Object.entries(options.headers ?? {})) {
     const key = k.toLowerCase();
-    // `-A` already sets User-Agent; avoid duplicate Cookie when `options.cookie` is set.
+    // `-A` already sets User-Agent; avoid duplicate Cookie when jar/cookie is set.
     if (key === 'user-agent') continue;
-    if (key === 'cookie' && options.cookie) continue;
+    if (key === 'cookie' && (options.cookieJarPath || options.cookie)) continue;
     baseArgs.push('-H', `${k}: ${v}`);
   }
+
   if (options.body != null) {
     baseArgs.push('--data-binary', options.body);
   }
@@ -229,7 +245,15 @@ function responseFromCurl(res: CurlResponse): Response {
 }
 
 /** Minimal fetch-compatible wrapper around system curl (for DocIdRegistry etc.). */
-export function createCurlFetch(userAgent?: string): typeof fetch {
+export function createCurlFetch(
+  userAgentOrOptions?: string | CurlFetchOptions,
+  maybeOptions?: CurlFetchOptions,
+): typeof fetch {
+  const options: CurlFetchOptions =
+    typeof userAgentOrOptions === 'string'
+      ? { userAgent: userAgentOrOptions, ...(maybeOptions ?? {}) }
+      : (userAgentOrOptions ?? {});
+
   const impl = (async (input: string | URL | Request, init?: RequestInit) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -246,7 +270,8 @@ export function createCurlFetch(userAgent?: string): typeof fetch {
       method: init?.method,
       headers: headerObj,
       body,
-      userAgent: userAgent ?? headers.get('user-agent') ?? undefined,
+      userAgent: options.userAgent ?? headers.get('user-agent') ?? undefined,
+      cookieJarPath: options.cookieJarPath,
     });
     return responseFromCurl(res);
   }) as typeof fetch;

@@ -34,14 +34,19 @@ import type {
   WebProfileUser,
 } from './types.js';
 import {
+  cookieHeaderFromJarMap,
+  cookieJarDiagnostics,
   extractLsdToken,
   generateDeviceId,
+  getCookieValueFromHeader,
   mergeCookies,
   parseSetCookie,
   postIdFromThreadId,
   postIdFromUrl,
+  readCookieJarFile,
   signPayload,
   threadIdFromPostId,
+  type CookieJarDiagnostics,
 } from './utils.js';
 
 export type HttpTransport = 'fetch' | 'curl' | 'auto';
@@ -66,6 +71,14 @@ export interface ThreadsAPIOptions {
   locale?: string;
   /** Path for persistent doc_id cache (QuaX-style). */
   docIdCachePath?: string;
+  /**
+   * Netscape cookie jar path for curl (`--cookie` / `--cookie-jar`).
+   * Defaults to `XY_COOKIE_JAR` or `.xy-cookies.txt`. Persist across deploys
+   * (EU consent cookies: datr/mid/ig_did/csrftoken).
+   */
+  cookieJarPath?: string;
+  /** Disable disk cookie jar (tests / explicit cold requests). */
+  disableCookieJar?: boolean;
   /** Seed/override doc ids. */
   docIds?: DocIdMap;
   fetchImpl?: typeof fetch;
@@ -90,6 +103,8 @@ export class ThreadsAPI {
   userAgent: string;
   locale: string;
   cookie = '';
+  /** Absolute or relative Netscape jar path; empty string means disabled. */
+  readonly cookieJarPath: string;
 
   readonly docIds: DocIdRegistry;
   private readonly fetchImpl: typeof fetch;
@@ -97,6 +112,8 @@ export class ThreadsAPI {
   readonly transport: HttpTransport;
   /** Last concrete transport that actually ran a request. */
   private lastTransportUsed: TransportKind;
+  /** True after a successful warmCookieJar / bootstrap that populated cookies. */
+  private cookieJarWarmed = false;
 
   constructor(options: ThreadsAPIOptions = {}) {
     this.username = options.username ?? process.env.THREADS_USERNAME;
@@ -112,15 +129,33 @@ export class ThreadsAPI {
     this.locale = options.locale ?? 'en-US';
     this.transport = options.transport ?? 'curl';
     this.lastTransportUsed = this.transport === 'fetch' ? 'fetch' : 'curl';
+    this.cookieJarPath = options.disableCookieJar
+      ? ''
+      : (options.cookieJarPath ?? process.env.XY_COOKIE_JAR ?? '.xy-cookies.txt');
+
+    // Seed in-memory cookie string from an existing jar (survives process restart).
+    if (this.cookieJarPath) {
+      this.syncCookieFromJar();
+      if (this.cookie) this.cookieJarWarmed = true;
+    }
+
     this.fetchImpl =
       options.fetchImpl ??
-      (this.transport === 'fetch' ? fetch : createCurlFetch(this.userAgent));
+      (this.transport === 'fetch'
+        ? fetch
+        : createCurlFetch({
+            userAgent: this.userAgent,
+            cookieJarPath: this.cookieJarPath || undefined,
+          }));
 
     const discoveryOptions: DocIdDiscoveryOptions = {
       verbose: this.verbose,
       userAgent: this.userAgent,
       cachePath: options.docIdCachePath,
-      fetchImpl: this.fetchImpl,
+      // Bound fetch so doc-id bootstrap shares the same jar + memory cookies.
+      fetchImpl: options.fetchImpl
+        ? this.fetchImpl
+        : (url, init) => this.rawFetch(String(url), init ?? {}),
     };
     this.docIds = new DocIdRegistry(discoveryOptions);
     if (options.docIds) {
@@ -139,6 +174,7 @@ export class ThreadsAPI {
     lsd_is_default: boolean;
     has_cookies: boolean;
     authenticated: boolean;
+    cookie_jar: CookieJarDiagnostics | { disabled: true };
   } {
     const lsdIsDefault = !this.fbLsdToken || this.fbLsdToken === DEFAULT_LSD_TOKEN;
     return {
@@ -146,8 +182,11 @@ export class ThreadsAPI {
       last_transport: this.lastTransportUsed,
       lsd_present: Boolean(this.fbLsdToken),
       lsd_is_default: lsdIsDefault,
-      has_cookies: Boolean(this.cookie && this.cookie.length > 0),
+      has_cookies: Boolean(this.cookie && this.cookie.length > 0) || this.jarLooksWarm(),
       authenticated: Boolean(this.token),
+      cookie_jar: this.cookieJarPath
+        ? cookieJarDiagnostics(this.cookieJarPath)
+        : { disabled: true },
     };
   }
 
@@ -155,10 +194,106 @@ export class ThreadsAPI {
   // Low-level HTTP
   // ---------------------------------------------------------------------------
 
+  private syncCookieFromJar(): void {
+    if (!this.cookieJarPath) return;
+    const map = readCookieJarFile(this.cookieJarPath);
+    if (!map.size) return;
+    this.cookie = mergeCookies(this.cookie, cookieHeaderFromJarMap(map));
+  }
+
+  private jarLooksWarm(): boolean {
+    if (!this.cookieJarPath) return Boolean(this.cookie);
+    const diag = cookieJarDiagnostics(this.cookieJarPath);
+    return diag.has_csrftoken || diag.has_mid || diag.has_ig_did;
+  }
+
+  private getCookieValue(name: string): string | undefined {
+    const fromMemory = getCookieValueFromHeader(this.cookie, name);
+    if (fromMemory) return fromMemory;
+    if (!this.cookieJarPath) return undefined;
+    return readCookieJarFile(this.cookieJarPath).get(name);
+  }
+
+  private csrfHeaders(): Record<string, string> {
+    const csrf = this.getCookieValue('csrftoken');
+    return csrf ? { 'x-csrftoken': csrf } : {};
+  }
+
+  /**
+   * Warm the curl cookie jar by loading Threads HTML (EU consent / session cookies).
+   * Idempotent unless `force` is set. Doc-id bootstrap also writes to the same jar.
+   */
+  async warmCookieJar(force = false): Promise<void> {
+    if (!force && (this.cookieJarWarmed || this.jarLooksWarm())) {
+      this.syncCookieFromJar();
+      this.cookieJarWarmed = true;
+      return;
+    }
+
+    if (this.verbose) {
+      console.debug(
+        force
+          ? '[cookies] refreshing jar (force / consent heal)…'
+          : '[cookies] warming jar via Threads HTML…',
+      );
+    }
+
+    // Prefer threads.net root — same host web_profile_info uses first.
+    // Also hit a profile page so LSD can be refreshed in the same pass.
+    const urls = [`${THREADS_BASE_URL}/`, `${THREADS_WWW_URL}/@zuck`];
+    for (const url of urls) {
+      try {
+        const res = await this.rawFetch(url, {
+          headers: {
+            accept: 'text/html,application/xhtml+xml',
+            'user-agent': this.userAgent,
+          },
+        });
+        const html = await res.text();
+        const token = extractLsdToken(html);
+        if (token && !this.noUpdateLsd) this.fbLsdToken = token;
+      } catch (err) {
+        if (this.verbose) {
+          console.debug(
+            '[cookies] warm request failed',
+            url,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
+    }
+
+    this.syncCookieFromJar();
+    this.cookieJarWarmed = this.jarLooksWarm() || Boolean(this.cookie);
+    if (this.verbose) {
+      const diag = this.cookieJarPath
+        ? cookieJarDiagnostics(this.cookieJarPath)
+        : undefined;
+      console.debug('[cookies] warm done', {
+        has_memory_cookies: Boolean(this.cookie),
+        jar: diag
+          ? {
+              exists: diag.exists,
+              has_csrftoken: diag.has_csrftoken,
+              has_mid: diag.has_mid,
+              names: diag.cookie_names,
+            }
+          : null,
+      });
+    }
+  }
+
   private async rawFetch(url: string, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
     if (!headers.has('user-agent')) headers.set('user-agent', this.userAgent);
-    if (this.cookie && !headers.has('cookie')) headers.set('cookie', this.cookie);
+    // When using a disk jar, curl owns Cookie; otherwise send the memory string.
+    if (!this.cookieJarPath && this.cookie && !headers.has('cookie')) {
+      headers.set('cookie', this.cookie);
+    }
+    if (!headers.has('x-csrftoken')) {
+      const csrf = this.getCookieValue('csrftoken');
+      if (csrf) headers.set('x-csrftoken', csrf);
+    }
 
     if (this.transport === 'curl') {
       return this.rawCurl(url, init, headers);
@@ -185,8 +320,10 @@ export class ThreadsAPI {
     headers.forEach((v, k) => {
       headerObj[k] = v;
     });
-    // Prefer a single Cookie header via curlRequest's `cookie` option (avoids duplicates).
-    const cookie = this.cookie || headerObj.cookie || undefined;
+    // Jar is source of truth when configured; otherwise pass Cookie header string.
+    const cookie = this.cookieJarPath
+      ? undefined
+      : this.cookie || headerObj.cookie || undefined;
     delete headerObj.cookie;
 
     const method = (init.method ?? 'GET').toUpperCase();
@@ -200,11 +337,13 @@ export class ThreadsAPI {
       body,
       userAgent: this.userAgent,
       cookie,
+      cookieJarPath: this.cookieJarPath || undefined,
     });
     if (curlRes.headers['set-cookie']) {
       const parts = curlRes.headers['set-cookie'].split('\n').filter(Boolean);
       this.cookie = mergeCookies(this.cookie, parseSetCookie(parts));
     }
+    this.syncCookieFromJar();
     // Response headers cannot contain raw Set-Cookie multi-values with newlines;
     // status 0 would throw in `new Response` — clamp to a valid gateway error.
     const status =
@@ -243,6 +382,7 @@ export class ThreadsAPI {
       'x-asbd-id': DEFAULT_ASBD_ID,
       'x-fb-lsd': this.fbLsdToken,
       'x-ig-app-id': WEB_IG_APP_ID,
+      ...this.csrfHeaders(),
       ...extra,
     };
   }
@@ -266,6 +406,7 @@ export class ThreadsAPI {
 
   /** Fetch a fresh LSD token (and cookies) from threads.com. */
   async refreshLsd(username = 'zuck'): Promise<string> {
+    await this.warmCookieJar();
     const res = await this.rawFetch(`${THREADS_WWW_URL}/@${username}`, {
       headers: {
         accept: 'text/html,application/xhtml+xml',
@@ -288,12 +429,17 @@ export class ThreadsAPI {
       );
     }
     if (!this.noUpdateLsd) this.fbLsdToken = token;
+    this.syncCookieFromJar();
     if (this.verbose) console.debug('[lsd] refreshed');
     return token;
   }
 
   async ensureLsd(): Promise<string> {
-    if (this.fbLsdToken && this.fbLsdToken !== DEFAULT_LSD_TOKEN && this.cookie) {
+    if (
+      this.fbLsdToken &&
+      this.fbLsdToken !== DEFAULT_LSD_TOKEN &&
+      (this.cookie || this.jarLooksWarm())
+    ) {
       return this.fbLsdToken;
     }
     return this.refreshLsd();
@@ -301,7 +447,12 @@ export class ThreadsAPI {
 
   /** Refresh GraphQL doc_ids by scraping Threads JS bundles (QuaX-style). */
   async refreshDocIds(force = false): Promise<DocIdMap> {
-    return this.docIds.ensureFresh(force);
+    // Bootstrap HTML write goes into the same cookie jar via rawFetch.
+    await this.warmCookieJar(force);
+    const map = await this.docIds.ensureFresh(force);
+    this.syncCookieFromJar();
+    this.cookieJarWarmed = this.jarLooksWarm() || this.cookieJarWarmed;
+    return map;
   }
 
   // ---------------------------------------------------------------------------
@@ -360,7 +511,7 @@ export class ThreadsAPI {
       // self-heal if the raw text matches before giving up on parse.
       if (options.retryOnStaleDocId !== false && upstream === 'stale_identifier') {
         if (this.verbose) {
-          console.debug('[graphql] stale identifier in non-JSON body, refreshing doc_ids…');
+          console.debug('[graphql] stale identifier in non-JSON body, refreshing cookies + doc_ids…');
         }
         await this.refreshDocIds(true);
         return this.graphql(operationName, variables, {
@@ -403,7 +554,7 @@ export class ThreadsAPI {
       if (this.verbose) {
         console.debug(
           staleIdentifier
-            ? '[graphql] stale identifier / fbtype mismatch, refreshing doc_ids…'
+            ? '[graphql] stale identifier / fbtype mismatch, refreshing cookies + doc_ids…'
             : '[graphql] stale doc_id, refreshing…',
         );
       }
@@ -441,8 +592,11 @@ export class ThreadsAPI {
    * Requires HTTP/2 curl transport on many networks (HTTP/1.1 → empty 429).
    */
   async getWebProfile(username: string): Promise<WebProfileUser> {
+    // EU consent gating rejects cold web_profile_info without session cookies.
+    await this.warmCookieJar();
+
     let lastError: ThreadsAPIError | undefined;
-    /** One forced refreshDocIds + retry when Meta returns NodeInvalidType / fbtype mismatch. */
+    /** One forced cookie+doc_id refresh when Meta returns NodeInvalidType / fbtype mismatch. */
     let didStaleRefresh = false;
     /** Skip backoff once after a stale-identifier heal (immediate retry). */
     let skipBackoffOnce = false;
@@ -476,6 +630,7 @@ export class ThreadsAPI {
               'x-asbd-id': DEFAULT_ASBD_ID,
               referer: `${origin}/`,
               origin,
+              ...this.csrfHeaders(),
             },
           });
         } catch (err) {
@@ -587,19 +742,19 @@ export class ThreadsAPI {
               },
             },
           );
-          // Self-heal once: refresh cached doc_ids, then retry this host (and keep
-          // going if still stale). GraphQL paths also refresh on the same pattern.
+          // Self-heal once: re-warm EU consent cookies + refresh doc_ids, then retry.
           if (classified === 'stale_identifier' && !didStaleRefresh) {
             didStaleRefresh = true;
             if (this.verbose) {
               console.debug(
-                '[web_profile] stale identifier / fbtype mismatch, refreshing doc_ids…',
+                '[web_profile] stale identifier / consent-type error, refreshing cookies + doc_ids…',
               );
             }
             try {
+              // refreshDocIds(true) force-warms the cookie jar first.
               await this.refreshDocIds(true);
             } catch {
-              // Discovery failure should not hide the original upstream error.
+              // Discovery/warm failure should not hide the original upstream error.
             }
             // Exactly one immediate retry on this host after heal.
             skipBackoffOnce = true;

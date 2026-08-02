@@ -2,6 +2,7 @@ node_modules/
 dist/
 .xy-doc-ids.json
 .xy-doc-ids.test.json
+.xy-cookies.txt
 discovered-doc-ids.latest.json
 *.log
 .env

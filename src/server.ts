@@ -33,11 +33,28 @@ const api = new ThreadsAPI({
 });
 
 function send(res: ServerResponse, status: number, body: unknown): void {
-  const json = JSON.stringify(body, null, 2);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-  });
+  if (res.writableEnded) {
+    console.error('[xy-threads] send() skipped — response already ended', status);
+    return;
+  }
+  let json: string;
+  try {
+    json = JSON.stringify(body, null, 2);
+  } catch (err) {
+    console.error('[xy-threads] JSON.stringify failed in send()', err);
+    json = JSON.stringify({
+      error: 'internal_error',
+      message: 'failed to serialize response',
+    });
+    status = 500;
+  }
+  if (!res.headersSent) {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    });
+  }
   res.end(json);
 }
 
@@ -382,12 +399,30 @@ const server = createServer(async (req, res) => {
     notFound(res);
   } catch (err) {
     console.error('[xy-threads] request error', err);
+    if (res.writableEnded) {
+      console.error('[xy-threads] cannot send error — response already ended');
+      return;
+    }
     try {
       sendError(res, err);
     } catch (sendErr) {
       console.error('[xy-threads] failed to send error', sendErr);
-      res.statusCode = 500;
-      res.end('{"error":"internal_error"}');
+      try {
+        if (!res.headersSent) {
+          res.writeHead(500, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+          });
+        }
+        res.end(
+          JSON.stringify({
+            error: 'internal_error',
+            message: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      } catch (finalErr) {
+        console.error('[xy-threads] failed to end response', finalErr);
+      }
     }
   }
 });

@@ -146,11 +146,13 @@ export function httpStatusForThreadsError(err: ThreadsAPIError): number {
   if (s === 429) return 429;
   if (s === 401 || s === 403) return s;
   if (s === 404) return 404;
-  if (s != null && s >= 500) return 502;
+  // Origin "gateway" failures that Cloudflare should not confuse with a dead app:
+  // return 500 with a JSON body (not bare 502) so the edge forwards our payload.
+  if (s != null && s >= 500) return 500;
   if (err.upstream === 'rate_limited') return 429;
-  if (err.upstream === 'html_challenge' || err.upstream === 'empty_body') return 502;
-  if (err.upstream === 'stale_identifier') return 502;
+  if (err.upstream === 'html_challenge' || err.upstream === 'empty_body') return 500;
+  if (err.upstream === 'stale_identifier') return 500;
   if (err.name === 'DocIdNotFoundError') return 503;
-  if (s != null && s >= 400) return 502;
+  if (s != null && s >= 400) return 500;
   return 500;
 }

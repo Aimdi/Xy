@@ -27,6 +27,31 @@ describe('Netscape cookie jar helpers', () => {
     expect(cookieHeaderFromJarMap(map)).toContain('csrftoken=abc');
   });
 
+  it('parses #HttpOnly_ cookies (mid/ig_did) instead of treating them as comments', () => {
+    const text = [
+      '# Netscape HTTP Cookie File',
+      '#HttpOnly_.instagram.com\tTRUE\t/\tTRUE\t1820240546\tmid\thidden-mid',
+      '#HttpOnly_.instagram.com\tTRUE\t/\tTRUE\t1817216575\tig_did\thidden-did',
+      '.instagram.com\tTRUE\t/\tTRUE\t1820240546\tcsrftoken\tvisible-csrf',
+      '.instagram.com\tTRUE\t/\tTRUE\t1817216575\tig_nrcb\t1',
+    ].join('\n');
+    const map = parseNetscapeCookieJar(text);
+    expect(map.get('mid')).toBe('hidden-mid');
+    expect(map.get('ig_did')).toBe('hidden-did');
+    expect(map.get('csrftoken')).toBe('visible-csrf');
+    expect(map.get('ig_nrcb')).toBe('1');
+
+    const dir = mkdtempSync(join(tmpdir(), 'xy-jar-'));
+    const jar = join(dir, 'http-only.txt');
+    writeFileSync(jar, text);
+    const diag = cookieJarDiagnostics(jar);
+    expect(diag.has_mid).toBe(true);
+    expect(diag.has_ig_did).toBe(true);
+    expect(diag.has_ig_nrcb).toBe(true);
+    expect(diag.consent_ready).toBe(true);
+    expect(diag.cookie_names).toEqual(['csrftoken', 'ig_did', 'ig_nrcb', 'mid']);
+  });
+
   it('reads jar files and reports safe diagnostics', () => {
     const dir = mkdtempSync(join(tmpdir(), 'xy-jar-'));
     const jar = join(dir, 'c.txt');
@@ -41,6 +66,7 @@ describe('Netscape cookie jar helpers', () => {
     expect(diag.exists).toBe(true);
     expect(diag.has_csrftoken).toBe(true);
     expect(diag.has_mid).toBe(true);
+    expect(diag.consent_ready).toBe(true);
     expect(diag.cookie_names).toEqual(['csrftoken', 'mid']);
     expect(JSON.stringify(diag)).not.toMatch(/csrftoken=x/);
   });
@@ -53,25 +79,32 @@ describe('Netscape cookie jar helpers', () => {
 
 describe('curl cookie jar live warm', () => {
   it(
-    'GET threads.net with --cookie-jar captures session cookies',
+    'GET Instagram + Threads with shared jar captures mid/ig_did + csrftoken',
     async () => {
       const dir = mkdtempSync(join(tmpdir(), 'xy-live-jar-'));
       const jar = join(dir, 'cookies.txt');
-      const res = await curlRequest('https://www.threads.net/', {
-        cookieJarPath: jar,
-        headers: { accept: 'text/html,application/xhtml+xml' },
-        timeoutSec: 25,
-      });
-      expect(res.status).toBeGreaterThanOrEqual(200);
-      expect(existsSync(jar)).toBe(true);
-      const body = readFileSync(jar, 'utf8');
-      // Meta typically sets at least one of these on the HTML bootstrap.
-      const hasSession =
-        /\t(csrftoken|mid|ig_did|datr|ig_nrcb)\t/.test(body) ||
-        Boolean(res.headers['set-cookie']);
-      expect(hasSession).toBe(true);
 
-      // Reuse jar on web_profile_info — still works from this US VM.
+      for (const url of [
+        'https://www.instagram.com/',
+        'https://i.instagram.com/',
+        'https://www.threads.net/',
+      ]) {
+        const res = await curlRequest(url, {
+          cookieJarPath: jar,
+          headers: { accept: 'text/html,application/xhtml+xml' },
+          timeoutSec: 25,
+        });
+        expect(res.status).toBeGreaterThanOrEqual(200);
+        expect(res.hops?.length).toBeGreaterThanOrEqual(1);
+      }
+
+      expect(existsSync(jar)).toBe(true);
+      const diag = cookieJarDiagnostics(jar);
+      expect(diag.has_csrftoken).toBe(true);
+      expect(diag.has_mid || diag.has_ig_did).toBe(true);
+      expect(diag.consent_ready).toBe(true);
+      expect(diag.cookie_names.length).toBeGreaterThan(1);
+
       const csrf = readCookieJarFile(jar).get('csrftoken');
       const profile = await curlRequest(
         'https://www.threads.net/api/v1/users/web_profile_info/?username=zuck',

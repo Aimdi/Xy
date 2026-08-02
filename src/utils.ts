@@ -90,10 +90,16 @@ export function mergeCookies(existing: string, incoming: string): string {
 export function parseNetscapeCookieJar(text: string): Map<string, string> {
   const map = new Map<string, string>();
   for (const rawLine of String(text).split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!rawLine.trim()) continue;
+    // HttpOnly cookies are stored as "#HttpOnly_.domain\t..." — must NOT treat as comments.
+    let line = rawLine;
+    if (line.startsWith('#HttpOnly_')) {
+      line = line.slice('#HttpOnly_'.length);
+    } else if (line.trimStart().startsWith('#')) {
+      continue;
+    }
     // domain \t flag \t path \t secure \t expires \t name \t value
-    const parts = rawLine.split('\t');
+    const parts = line.split('\t');
     if (parts.length < 7) continue;
     const name = parts[5]?.trim();
     const value = parts.slice(6).join('\t').trim();
@@ -139,6 +145,10 @@ export interface CookieJarDiagnostics {
   has_csrftoken: boolean;
   has_mid: boolean;
   has_ig_did: boolean;
+  has_ig_nrcb: boolean;
+  has_datr: boolean;
+  /** True when mid or ig_did is present (consent/session markers, not just csrf). */
+  consent_ready: boolean;
   cookie_names: string[];
 }
 
@@ -151,6 +161,9 @@ export function cookieJarDiagnostics(jarPath: string): CookieJarDiagnostics {
     has_csrftoken: false,
     has_mid: false,
     has_ig_did: false,
+    has_ig_nrcb: false,
+    has_datr: false,
+    consent_ready: false,
     cookie_names: [],
   };
   try {
@@ -158,14 +171,19 @@ export function cookieJarDiagnostics(jarPath: string): CookieJarDiagnostics {
     const st = statSync(jarPath);
     const map = parseNetscapeCookieJar(readFileSync(jarPath, 'utf8'));
     const names = [...map.keys()].sort();
+    const has_mid = map.has('mid');
+    const has_ig_did = map.has('ig_did');
     return {
       path: jarPath,
       exists: true,
       size: st.size,
       mtime: st.mtime.toISOString(),
       has_csrftoken: map.has('csrftoken'),
-      has_mid: map.has('mid'),
-      has_ig_did: map.has('ig_did'),
+      has_mid,
+      has_ig_did,
+      has_ig_nrcb: map.has('ig_nrcb'),
+      has_datr: map.has('datr'),
+      consent_ready: has_mid || has_ig_did,
       cookie_names: names,
     };
   } catch {

@@ -86,20 +86,20 @@ describe('ThreadsAPIError', () => {
     expect(String(json.data_preview).length).toBeLessThan(300);
   });
 
-  it('maps html_challenge to 502 for the local server', () => {
-    const err = new ThreadsAPIError('blocked', undefined, 200, {
-      upstream: 'html_challenge',
-      transport: 'fetch',
-    });
-    expect(httpStatusForThreadsError(err)).toBe(502);
-  });
-
-  it('maps stale_identifier to 502 (not an IP-block 429)', () => {
+  it('maps stale_identifier to 500 JSON (not a bare CF-style 502)', () => {
     const err = new ThreadsAPIError('stale doc', undefined, 400, {
       upstream: 'stale_identifier',
       transport: 'curl',
     });
-    expect(httpStatusForThreadsError(err)).toBe(502);
+    expect(httpStatusForThreadsError(err)).toBe(500);
+  });
+
+  it('maps html_challenge to 500 for the local server', () => {
+    const err = new ThreadsAPIError('blocked', undefined, 200, {
+      upstream: 'html_challenge',
+      transport: 'fetch',
+    });
+    expect(httpStatusForThreadsError(err)).toBe(500);
   });
 });
 

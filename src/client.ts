@@ -6,6 +6,7 @@ import {
   DEFAULT_LSD_TOKEN,
   DEFAULT_USER_AGENT,
   INSTAGRAM_API_URL,
+  INSTAGRAM_WWW_URL,
   THREADS_BASE_URL,
   THREADS_GRAPHQL_URL,
   THREADS_WWW_URL,
@@ -202,9 +203,17 @@ export class ThreadsAPI {
   }
 
   private jarLooksWarm(): boolean {
-    if (!this.cookieJarPath) return Boolean(this.cookie);
+    if (!this.cookieJarPath) {
+      // Memory-only: need more than csrftoken to count as consent-ready.
+      return Boolean(
+        getCookieValueFromHeader(this.cookie, 'mid') ||
+          getCookieValueFromHeader(this.cookie, 'ig_did'),
+      );
+    }
     const diag = cookieJarDiagnostics(this.cookieJarPath);
-    return diag.has_csrftoken || diag.has_mid || diag.has_ig_did;
+    // csrftoken alone is NOT enough — Meta sets that on every page touch.
+    // mid / ig_did are the session markers browsers keep after a real warm.
+    return diag.consent_ready;
   }
 
   private getCookieValue(name: string): string | undefined {
@@ -220,8 +229,14 @@ export class ThreadsAPI {
   }
 
   /**
-   * Warm the curl cookie jar by loading Threads HTML (EU consent / session cookies).
-   * Idempotent unless `force` is set. Doc-id bootstrap also writes to the same jar.
+   * Warm the curl cookie jar by loading Instagram + Threads HTML.
+   *
+   * Threads alone usually only sets `csrftoken`. Instagram www sets `mid`,
+   * and `i.instagram.com` sets `ig_did` / `ig_nrcb`. EU consent gating needs
+   * those session markers — csrftoken alone is not enough.
+   *
+   * Uses curl `-L` + `--cookie`/`--cookie-jar` on one shared file so cookies
+   * accumulate across hosts instead of being replaced.
    */
   async warmCookieJar(force = false): Promise<void> {
     if (!force && (this.cookieJarWarmed || this.jarLooksWarm())) {
@@ -234,25 +249,66 @@ export class ThreadsAPI {
       console.debug(
         force
           ? '[cookies] refreshing jar (force / consent heal)…'
-          : '[cookies] warming jar via Threads HTML…',
+          : '[cookies] warming jar via Instagram + Threads HTML…',
       );
     }
 
-    // Prefer threads.net root — same host web_profile_info uses first.
-    // Also hit a profile page so LSD can be refreshed in the same pass.
-    const urls = [`${THREADS_BASE_URL}/`, `${THREADS_WWW_URL}/@zuck`];
+    // Order matters for accumulation: IG first (mid/ig_did), then Threads (csrf/LSD).
+    const urls = [
+      `${INSTAGRAM_WWW_URL}/`,
+      `${INSTAGRAM_API_URL}/`,
+      `${THREADS_BASE_URL}/`,
+      `${THREADS_WWW_URL}/`,
+      `${THREADS_WWW_URL}/@zuck`,
+    ];
+
+    const warmLogs: Array<Record<string, unknown>> = [];
+
     for (const url of urls) {
       try {
-        const res = await this.rawFetch(url, {
-          headers: {
-            accept: 'text/html,application/xhtml+xml',
-            'user-agent': this.userAgent,
-          },
-        });
-        const html = await res.text();
-        const token = extractLsdToken(html);
-        if (token && !this.noUpdateLsd) this.fbLsdToken = token;
+        // Prefer curlRequest directly so we keep hop / Set-Cookie diagnostics and
+        // always write through the shared Netscape jar (--cookie + --cookie-jar).
+        if (this.cookieJarPath && this.transport !== 'fetch') {
+          const curlRes = await curlRequest(url, {
+            method: 'GET',
+            headers: {
+              accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'accept-language': `${this.locale},${this.locale.split('-')[0]};q=0.9`,
+            },
+            userAgent: this.userAgent,
+            cookieJarPath: this.cookieJarPath,
+            timeoutSec: 25,
+          });
+          this.lastTransportUsed = 'curl';
+          if (curlRes.headers['set-cookie']) {
+            const parts = curlRes.headers['set-cookie'].split('\n').filter(Boolean);
+            this.cookie = mergeCookies(this.cookie, parseSetCookie(parts));
+          }
+          const token = extractLsdToken(curlRes.body);
+          if (token && !this.noUpdateLsd) this.fbLsdToken = token;
+          warmLogs.push({
+            url,
+            status: curlRes.status,
+            hops: curlRes.hops,
+            set_cookie_names: (curlRes.hops ?? []).flatMap((h) => h.setCookieNames),
+          });
+        } else {
+          const res = await this.rawFetch(url, {
+            headers: {
+              accept: 'text/html,application/xhtml+xml',
+              'user-agent': this.userAgent,
+            },
+          });
+          const html = await res.text();
+          const token = extractLsdToken(html);
+          if (token && !this.noUpdateLsd) this.fbLsdToken = token;
+          warmLogs.push({ url, status: res.status });
+        }
       } catch (err) {
+        warmLogs.push({
+          url,
+          error: err instanceof Error ? err.message : String(err),
+        });
         if (this.verbose) {
           console.debug(
             '[cookies] warm request failed',
@@ -264,11 +320,31 @@ export class ThreadsAPI {
     }
 
     this.syncCookieFromJar();
-    this.cookieJarWarmed = this.jarLooksWarm() || Boolean(this.cookie);
-    if (this.verbose) {
-      const diag = this.cookieJarPath
-        ? cookieJarDiagnostics(this.cookieJarPath)
-        : undefined;
+    this.cookieJarWarmed = this.jarLooksWarm();
+    const diag = this.cookieJarPath
+      ? cookieJarDiagnostics(this.cookieJarPath)
+      : undefined;
+
+    if (this.cookieJarPath && !this.jarLooksWarm()) {
+      // Always log when consent cookies are missing — this is the EU failure mode.
+      console.warn('[cookies] warm incomplete — missing mid/ig_did (consent markers)', {
+        jar: diag
+          ? {
+              exists: diag.exists,
+              size: diag.size,
+              has_csrftoken: diag.has_csrftoken,
+              has_mid: diag.has_mid,
+              has_ig_did: diag.has_ig_did,
+              has_ig_nrcb: diag.has_ig_nrcb,
+              has_datr: diag.has_datr,
+              names: diag.cookie_names,
+            }
+          : null,
+        warm_log: warmLogs,
+        hint:
+          'EU hosts may need a consent interstitial POST or US egress (XY_PROXY). Inspect warm_log hops/set_cookie_names.',
+      });
+    } else if (this.verbose) {
       console.debug('[cookies] warm done', {
         has_memory_cookies: Boolean(this.cookie),
         jar: diag
@@ -276,6 +352,8 @@ export class ThreadsAPI {
               exists: diag.exists,
               has_csrftoken: diag.has_csrftoken,
               has_mid: diag.has_mid,
+              has_ig_did: diag.has_ig_did,
+              has_ig_nrcb: diag.has_ig_nrcb,
               names: diag.cookie_names,
             }
           : null,

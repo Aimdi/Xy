@@ -6,6 +6,8 @@ export interface CurlResponse {
   body: string;
   /** Last hop HTTP version from the dump-header status line (e.g. "2", "1.1"). */
   httpVersion?: string;
+  /** Redirect / status hops from the dump-header (status + location), oldest first. */
+  hops?: Array<{ status: number; location?: string; setCookieNames: string[] }>;
 }
 
 export interface CurlRequestOptions {
@@ -75,6 +77,8 @@ async function curlRequestViaFiles(
   const method = (options.method ?? 'GET').toUpperCase();
   const baseArgs = [
     '-sL',
+    '--max-redirs',
+    '10',
     '--max-time',
     String(options.timeoutSec ?? 20),
     '-A',
@@ -222,7 +226,30 @@ async function curlRequestViaFiles(
         'empty_429_over_http1_1; Meta requires HTTP/2 for this guest endpoint';
     }
 
-    return { status, headers, body, httpVersion };
+    const hopSummaries = hops.map((hop) => {
+      let hopStatus = 0;
+      let location: string | undefined;
+      const setCookieNames: string[] = [];
+      for (const line of hop.split(/\r?\n/)) {
+        const statusMatch = line.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/);
+        if (statusMatch) {
+          hopStatus = Number(statusMatch[1]);
+          continue;
+        }
+        const idx = line.indexOf(':');
+        if (idx === -1) continue;
+        const key = line.slice(0, idx).trim().toLowerCase();
+        const value = line.slice(idx + 1).trim();
+        if (key === 'location') location = value;
+        if (key === 'set-cookie') {
+          const name = value.split('=')[0]?.trim();
+          if (name) setCookieNames.push(name);
+        }
+      }
+      return { status: hopStatus, location, setCookieNames };
+    });
+
+    return { status, headers, body, httpVersion, hops: hopSummaries };
   } finally {
     try {
       rmSync(dir, { recursive: true, force: true });

@@ -76,6 +76,7 @@ describe('getWebProfile REST-only guest path', () => {
       fetchImpl,
       disableCookieJar: true,
     });
+    api.warmCookieJar = async () => {};
     const profile = await api.getUserProfile('zuck');
 
     expect(profile.username).toBe('zuck');

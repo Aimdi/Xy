@@ -153,6 +153,7 @@ export function httpStatusForThreadsError(err: ThreadsAPIError): number {
   if (err.upstream === 'html_challenge' || err.upstream === 'empty_body') return 500;
   if (err.upstream === 'stale_identifier') return 500;
   if (err.name === 'DocIdNotFoundError') return 503;
+  if (/authentication required|requires authentication/i.test(err.message)) return 501;
   if (s != null && s >= 400) return 500;
   return 500;
 }
